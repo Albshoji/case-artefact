@@ -52,6 +52,7 @@ class Agent:
             timeout=60_000, retry_options=types.HttpRetryOptions(attempts=1)))
         self.model = model or config.model_name()
         self.last_model_used: str | None = None
+        self.models_used: set[str] = set()
         self.session_id = session_id or uuid.uuid4().hex[:8]
         self.persist = persist
         self.on_tool = on_tool
@@ -120,6 +121,7 @@ class Agent:
                     response = self.client.models.generate_content(
                         model=model, contents=self._window(), config=cfg)
                     self.last_model_used = model
+                    self.models_used.add(model)
                     return response
                 except (errors.ServerError, errors.ClientError) as e:
                     retryable = isinstance(e, errors.ServerError) or getattr(e, "code", None) in (404, 429)

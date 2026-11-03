@@ -76,7 +76,7 @@ def run(name: str, title: str, messages: list[str]) -> str:
     lines = [
         f"# {title}",
         "",
-        f"> Gerado por `scripts/gerar_exemplos.py` · modelo `{agent.model}` · "
+        "> Gerado por `scripts/gerar_exemplos.py` · modelo `{MODELO}` · "
         f"data simulada {os.environ['AGENT_TODAY']} {os.environ['AGENT_TIME']} (quarta-feira)",
         "> As chamadas de ferramenta (invisíveis para o cliente) aparecem nos blocos recolhíveis.",
         "",
@@ -94,7 +94,8 @@ def run(name: str, title: str, messages: list[str]) -> str:
         reply = turn.reply.replace("\n", "  \n")
         lines += [f"**🎸 Tom:** {reply}", "", "---", ""]
         time.sleep(4)  # respeita o rate limit do free tier
-    return "\n".join(lines)
+    used = sorted(agent.models_used) or [agent.model]
+    return "\n".join(lines).replace("{MODELO}", ", ".join(used))
 
 
 def main() -> None:
