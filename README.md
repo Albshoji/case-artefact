@@ -6,7 +6,7 @@ catálogo, preços, promoções, status de pedido, trocas e devoluções, horár
 Ele decide sozinho quando consultar **dados** (CSVs) e quando consultar **políticas** (manual em PDF).
 
 - **Abordagem:** agente com *function calling* (tool use) e 9 ferramentas determinísticas em Python
-- **Modelo:** Google Gemini 2.5 Flash (free tier do Google AI Studio)
+- **Modelo:** Google Gemini 3.5 Flash (free tier do Google AI Studio), com modelos reserva em caso de sobrecarga
 - **Interface:** CLI com histórico persistente por sessão
 - **Exemplos de conversa:** [`examples/`](examples/)
 
@@ -55,7 +55,8 @@ Comandos dentro do chat: `/nova` (reinicia a conversa), `/debug` (liga/desliga o
 | Variável | Obrigatória | Descrição |
 |---|---|---|
 | `GEMINI_API_KEY` | sim | Chave do Google AI Studio |
-| `GEMINI_MODEL` | não | Modelo (padrão `gemini-2.5-flash`) |
+| `GEMINI_MODEL` | não | Modelo (padrão `gemini-3.5-flash`) |
+| `GEMINI_FALLBACK_MODELS` | não | Modelos reserva, separados por vírgula, usados se o principal der 503/429 (padrão `gemini-3-flash-preview,gemini-3.6-flash`) |
 | `AGENT_TODAY` | não | Fixa a "data de hoje" do agente (`YYYY-MM-DD`). Útil porque os pedidos do CSV são de out/2025 a mar/2026 — com `AGENT_TODAY=2026-03-25` os status e prazos ficam coerentes |
 | `AGENT_TIME` | não | Fixa a hora (`HH:MM`), para testar o comportamento fora do expediente |
 
@@ -76,7 +77,7 @@ python scripts/gerar_exemplos.py   # regenera examples/*.md rodando o agente de 
                     │   └─ Agent.send()  (emporio/agent.py)          │
                     │        │  histórico + system prompt dinâmico   │
                     │        ▼                                       │
-                    │   Gemini 2.5 Flash ──function call──┐          │
+                    │   Gemini 3.5 Flash ──function call──┐          │
                     │        ▲                            ▼          │
                     │        └──── resultado JSON ── tools.execute() │
                     └───────────────────────────────────┬────────────┘
@@ -140,8 +141,15 @@ nomeada (veja os blocos ⚙️ nos [exemplos](examples/)).
   mensagem), capturar o rastro das chamadas (debug e exemplos), tratar erro de ferramenta sem derrubar a
   conversa e fazer *rollback* do histórico se a API falhar.
 
-### 2. Modelo e provedor: Gemini 2.5 Flash (Google AI Studio, free tier)
+### 2. Modelo e provedor: Gemini 3.5 Flash (Google AI Studio, free tier)
 
+- O plano inicial era o `gemini-2.5-flash`, mas a API o recusa para chaves novas (404 com sugestão de migrar).
+  Testei os modelos flash disponíveis e escolhi o `gemini-3.5-flash`: estável e rápido (~4 s/resposta) no
+  momento dos testes, enquanto `gemini-3.7-flash`/`3.8-flash` devolviam 503 por alta demanda.
+- **Fallback entre modelos:** picos de 503 e a cota diária do free tier (20 requisições/dia **por modelo**)
+  são frequentes. O agente tenta cada modelo 2 vezes e depois passa para o próximo da lista
+  `GEMINI_FALLBACK_MODELS`. O retry interno do SDK foi desligado para o controle ficar num lugar só,
+  com timeout de 60 s por chamada.
 - Gratuito para prototipar, com function calling nativo e paralelo, bom português e baixa latência — o
   que importa num canal tipo WhatsApp.
 - Um modelo "flash" é suficiente porque a parte difícil (regras, contas, busca) está nas ferramentas;
@@ -257,14 +265,33 @@ Conversas reais geradas com `scripts/gerar_exemplos.py`, com as chamadas de ferr
 
 ---
 
+### O que a revisão das conversas mostrou
+
+Conferi cada valor citado nos exemplos contra os CSVs (preços, PIX, parcelas, % de promoção, datas de
+prazo): todos batem, porque vêm calculados pelas ferramentas. Pontos observados:
+
+- **Alucinação de reputação (exemplo 01):** ao recomendar um violão para iniciante, o modelo afirmou que o
+  Yamaha C40 é "um dos favoritos dos professores" e elogiou o controle de qualidade da marca. Nada disso
+  está nos dados. Adicionei ao prompt a regra de justificar recomendações só com descrição, especificações
+  e preço vindos das ferramentas. O exemplo foi mantido como gerado, para registrar o problema; a cota diária
+  do free tier acabou antes de eu conseguir gerá-lo de novo
+  (`python scripts/gerar_exemplos.py 01_catalogo_violoes`).
+- **Chamada desnecessária (exemplo 04):** diante de "meu pedido não chegou", o agente consultou a política de
+  frete antes de pedir os dados do pedido. Não prejudica a resposta, mas gasta uma requisição.
+- **Reaproveitamento de contexto:** em perguntas de acompanhamento ("e no PIX?", "aquela promoção ainda
+  vale?"), o agente usa dados que já vieram de ferramentas no mesmo turno ou em turnos anteriores, sem
+  consultar de novo. É o comportamento esperado ("consultar nesta conversa"), mas numa conversa longa o
+  estoque pode mudar; em produção, valeria limitar esse reaproveitamento a alguns minutos.
+
 ## Limitações conhecidas e próximos passos
 
 **Limitações**
 
 - **Avaliação manual.** A qualidade das respostas foi verificada lendo os exemplos; os testes
   automatizados cobrem ferramentas e loop, não o comportamento do LLM.
-- **Free tier do Gemini** tem limite de requisições por minuto/dia; sob carga, o agente faz *retry* com
-  backoff, mas não há fila.
+- **Free tier do Gemini** tem cota baixa (20 requisições/dia por modelo, e uma mensagem do cliente pode
+  gastar 2–3 requisições por causa das ferramentas). O fallback entre modelos ajuda, mas para uso real é
+  preciso um plano pago.
 - **Busca por palavra-chave**, não semântica: "violão bom pra igreja" não é mapeado para um tipo de
   instrumento. O LLM compensa reescrevendo a busca, mas pode falhar.
 - **Sem cálculo de frete por CEP** e sem saber feriados.
