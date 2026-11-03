@@ -47,8 +47,11 @@ class Agent:
         api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
         if not api_key:
             raise RuntimeError("Defina GEMINI_API_KEY (veja .env.example).")
-        self.client = genai.Client(api_key=api_key)
+        # timeout por chamada e sem retry interno do SDK: o retry/fallback é nosso (_generate)
+        self.client = genai.Client(api_key=api_key, http_options=types.HttpOptions(
+            timeout=60_000, retry_options=types.HttpRetryOptions(attempts=1)))
         self.model = model or config.model_name()
+        self.last_model_used: str | None = None
         self.session_id = session_id or uuid.uuid4().hex[:8]
         self.persist = persist
         self.on_tool = on_tool
@@ -107,17 +110,27 @@ class Agent:
             automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
             temperature=0.3,
         )
-        delay = 2.0
-        for attempt in range(6):
-            try:
-                return self.client.models.generate_content(model=self.model, contents=self._window(), config=cfg)
-            except (errors.ServerError, errors.ClientError) as e:
-                retryable = isinstance(e, errors.ServerError) or getattr(e, "code", None) == 429
-                if not retryable or attempt == 5:
-                    raise
-                time.sleep(delay + random.random())
-                delay = min(delay * 2, 60)
-        raise RuntimeError("unreachable")
+        # Estratégia: até 2 tentativas por modelo, depois cai para o próximo modelo reserva.
+        # Picos de demanda (503) no free tier são frequentes e costumam afetar um modelo por vez.
+        models = [self.model] + [m for m in config.fallback_models() if m != self.model]
+        last_error: Exception | None = None
+        for model in models:
+            for attempt in range(2):
+                try:
+                    response = self.client.models.generate_content(
+                        model=model, contents=self._window(), config=cfg)
+                    self.last_model_used = model
+                    return response
+                except (errors.ServerError, errors.ClientError) as e:
+                    retryable = isinstance(e, errors.ServerError) or getattr(e, "code", None) in (404, 429)
+                    if not retryable:
+                        raise
+                    last_error = e
+                    if getattr(e, "code", None) == 404:  # modelo indisponível p/ esta chave
+                        break
+                    time.sleep(1.5 * (attempt + 1) + random.random())
+        assert last_error is not None
+        raise last_error
 
     # ------------------------------------------------------------------ API pública
 
@@ -148,7 +161,8 @@ class Agent:
                     if self.on_tool:
                         self.on_tool(call)
                     parts.append(types.Part.from_function_response(name=fc.name, response={"result": result}))
-                self.history.append(types.Content(role="tool", parts=parts))
+                # API Gemini: respostas de função vão com role "user"
+                self.history.append(types.Content(role="user", parts=parts))
             else:
                 # estourou o limite de passos: fecha o turno com uma resposta segura
                 turn.reply = ("Hmm, essa ficou complexa pra mim. Posso deixar registrado para a equipe te "

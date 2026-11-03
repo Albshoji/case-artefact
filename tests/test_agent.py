@@ -44,7 +44,7 @@ def test_loop_executa_ferramenta_e_responde(make_agent):
     assert turn.tool_calls[0].name == "detalhes_produto"
     assert turn.tool_calls[0].result["preco_tabela"] == "R$ 2.199,00"
     # user, model(call), tool(result), model(text)
-    assert [c.role for c in a.history] == ["user", "model", "tool", "model"]
+    assert [c.role for c in a.history] == ["user", "model", "user", "model"]
 
 
 def test_historico_persistido_e_retomado(make_agent):

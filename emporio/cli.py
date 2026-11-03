@@ -24,7 +24,7 @@ HELP = "Comandos: /nova (limpa a conversa)  /debug (liga/desliga ferramentas)  /
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Tom — assistente virtual da Empório da Música")
     parser.add_argument("--sessao", help="id da sessão para retomar o histórico")
-    parser.add_argument("--modelo", help="modelo Gemini (padrão: GEMINI_MODEL ou gemini-2.5-flash)")
+    parser.add_argument("--modelo", help="modelo Gemini (padrão: GEMINI_MODEL ou gemini-3.5-flash)")
     parser.add_argument("--debug", action="store_true", help="mostra chamadas de ferramentas")
     args = parser.parse_args(argv)
 

@@ -20,11 +20,18 @@ LOGS_DIR = ROOT / "logs"
 
 TZ = ZoneInfo("America/Campo_Grande")
 
-DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_MODEL = "gemini-3.5-flash"
+# usados, em ordem, quando o modelo principal está sobrecarregado (503) ou sem cota (429)
+DEFAULT_FALLBACK_MODELS = "gemini-3-flash-preview,gemini-3.6-flash"
 
 
 def model_name() -> str:
     return os.getenv("GEMINI_MODEL") or DEFAULT_MODEL
+
+
+def fallback_models() -> list[str]:
+    raw = os.getenv("GEMINI_FALLBACK_MODELS", DEFAULT_FALLBACK_MODELS)
+    return [m.strip() for m in raw.split(",") if m.strip()]
 
 
 def now() -> datetime:
