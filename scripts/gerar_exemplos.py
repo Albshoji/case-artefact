@@ -81,21 +81,21 @@ def run(name: str, title: str, messages: list[str]) -> str:
         "> As chamadas de ferramenta (invisíveis para o cliente) aparecem nos blocos recolhíveis.",
         "",
     ]
+    used = set()
     for msg in messages:
-        turn = agent.send(msg)
+        reply, calls = agent.send(msg)
+        used.add(agent.model_used)
         lines += [f"**👤 Cliente:** {msg}", ""]
-        if turn.tool_calls:
-            lines += [f"<details><summary>⚙️ {len(turn.tool_calls)} chamada(s) de ferramenta: "
-                      f"{', '.join(c.name for c in turn.tool_calls)}</summary>", ""]
-            for c in turn.tool_calls:
-                lines += [f"`{c.name}({json.dumps(c.args, ensure_ascii=False)})`", "", "```json",
-                          fmt_json(c.result), "```", ""]
+        if calls:
+            lines += [f"<details><summary>⚙️ {len(calls)} chamada(s) de ferramenta: "
+                      f"{', '.join(c['nome'] for c in calls)}</summary>", ""]
+            for c in calls:
+                lines += [f"`{c['nome']}({json.dumps(c['args'], ensure_ascii=False)})`", "", "```json",
+                          fmt_json(c["resultado"]), "```", ""]
             lines += ["</details>", ""]
-        reply = turn.reply.replace("\n", "  \n")
-        lines += [f"**🎸 Tom:** {reply}", "", "---", ""]
+        lines += [f"**🎸 Tom:** {reply.replace(chr(10), '  ' + chr(10))}", "", "---", ""]
         time.sleep(4)  # respeita o rate limit do free tier
-    used = sorted(agent.models_used) or [agent.model]
-    return "\n".join(lines).replace("{MODELO}", ", ".join(used))
+    return "\n".join(lines).replace("{MODELO}", ", ".join(sorted(used - {""})))
 
 
 def main() -> None:

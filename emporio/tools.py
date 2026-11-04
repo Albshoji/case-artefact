@@ -1,458 +1,325 @@
-"""Ferramentas (function calling) que o agente pode chamar.
+"""Dados da loja (CSVs + manual) e as ferramentas que o agente pode chamar.
 
-Princípio: o LLM decide QUANDO consultar e COMO comunicar; toda conta, filtro e regra
-determinística (preço promocional, PIX, parcelamento, frete, prazos de devolução) é feita
-aqui em Python. LLMs erram aritmética e datas; código não.
+O LLM decide QUANDO consultar e COMO responder. Contas e regras (preço promocional, PIX,
+parcelas, prazos de devolução, verificação de identidade) ficam aqui, em Python.
+O SDK do Gemini gera o schema de cada ferramenta a partir da assinatura e da docstring.
 """
 
 from __future__ import annotations
 
+import csv
 import json
+import os
+import re
+import unicodedata
 import uuid
-from datetime import timedelta
-from typing import Any, Callable
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from zoneinfo import ZoneInfo
 
-from . import config, policies
-from .store import Order, Product, get_store
-
-# ----------------------------------------------------------------------------- formatação
-
-AVAILABILITY_LABELS = {
-    "disponivel": "disponível",
-    "esgotado": "esgotado no momento",
-    "descontinuado": "descontinuado (não faz mais parte do catálogo)",
-    "em_breve": "em breve (ainda não disponível para venda)",
-}
-
-SPEC_KEYS = {
-    "top": "tampo", "back_sides": "fundo e laterais", "neck": "braço", "strings": "cordas",
-    "scale": "escala", "electronics": "eletrônica/captação", "color": "cor", "body": "corpo",
-    "shells": "cascos", "pieces": "peças", "hardware": "ferragens", "keys": "teclas",
-    "type": "tipo", "polyphony": "polifonia",
-}
-SPEC_VALUES = {"steel": "aço", "yes": "sim", "no": "não", "included": "incluídas"}
-
-ORDER_STATUS = {
-    "pending": ("Pendente", "Pedido recebido, aguardando a confirmação do pagamento."),
-    "confirmed": ("Confirmado", "Pagamento aprovado; pedido em separação, ainda não despachado."),
-    "shipped": ("Enviado", "Pedido despachado e a caminho do endereço de entrega."),
-    "delivered": ("Entregue", "Pedido entregue."),
-    "cancelled": ("Cancelado", "Pedido cancelado."),
-}
+ROOT = Path(__file__).resolve().parent.parent
+LOGS_DIR = ROOT / "logs"
+TZ = ZoneInfo("America/Campo_Grande")
 
 
-def brl(value: float) -> str:
-    s = f"{value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-    return f"R$ {s}"
+def now() -> datetime:
+    """Data/hora do agente. AGENT_TODAY=YYYY-MM-DD e AGENT_TIME=HH:MM fixam valores (exemplos/testes)."""
+    n = datetime.now(TZ)
+    if d := os.getenv("AGENT_TODAY"):
+        n = datetime.combine(date.fromisoformat(d), n.time(), TZ)
+    if t := os.getenv("AGENT_TIME"):
+        hh, mm = map(int, t.split(":"))
+        n = n.replace(hour=hh, minute=mm)
+    return n
 
 
-def payment_label(code: str) -> str:
-    if code.startswith("credit_"):
-        n = code.removeprefix("credit_").rstrip("x")
-        return f"Cartão de crédito em {n}x"
-    return {"pix": "PIX", "debit": "Cartão de débito", "boleto": "Boleto bancário"}.get(code, code)
+# ----------------------------------------------------------------------------- carga dos dados
+
+def _csv(name: str) -> list[dict]:
+    with open(ROOT / "data" / f"desafio_tecnico_ai_eng - {name}.csv", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
 
 
-def product_summary(p: Product) -> dict:
-    out: dict[str, Any] = {
-        "id": p.product_id,
-        "nome": p.name,
-        "categoria": p.category,
-        "preco_tabela": brl(p.price),
-        "disponibilidade": AVAILABILITY_LABELS[p.availability],
-    }
-    if p.active_promo:
-        out["promocao_ativa"] = {
-            "campanha": p.active_promo.description,
-            "desconto": f"{p.active_promo.discount_percent:g}%",
-            "preco_promocional": brl(p.effective_price),
-            "obs": "Desconto PIX não é cumulativo com a promoção.",
-        }
-    elif p.sellable:
-        out["preco_no_pix"] = brl(round(p.price * 0.95, 2))
-    if p.sellable and p.stock <= 2:
-        out["estoque"] = "últimas unidades"
+def _norm(text: str) -> str:
+    """minúsculas e sem acento."""
+    text = unicodedata.normalize("NFKD", str(text))
+    return "".join(c for c in text if not unicodedata.combining(c)).lower()
+
+
+STOPWORDS = {"a", "o", "e", "de", "da", "do", "em", "um", "uma", "com", "para", "pra", "ate", "que"}
+# como o cliente fala → como está nos dados
+SYNONYMS = {"eletroacustico": "eletrico", "eletroacustica": "eletrico", "eletrica": "eletrico",
+            "classico": "nylon", "steel": "aco", "sintetizador": "synth"}
+
+
+def _words(text: str) -> set[str]:
+    """palavras normalizadas no singular simples (violões → violao, cordas → corda)."""
+    out = set()
+    for w in re.findall(r"[a-z0-9]+", _norm(text)):
+        if w in STOPWORDS:
+            continue
+        if w.endswith("oes"):
+            w = w[:-3] + "ao"
+        elif len(w) > 3 and w.endswith("s"):
+            w = w[:-1]
+        out.add(SYNONYMS.get(w, w))
     return out
 
 
-# ----------------------------------------------------------------------------- produtos
+CATEGORIES = {int(r["category_id"]): r["name"] for r in _csv("categories")}
+CUSTOMERS = {int(r["customer_id"]): r for r in _csv("customers")}
+ORDERS = {int(r["order_id"]): r for r in _csv("orders")}
+for _o in ORDERS.values():
+    _o["items"] = []
+for _r in _csv("order_items"):
+    ORDERS[int(_r["order_id"])]["items"].append(_r)
 
-def buscar_produtos(termo: str | None = None, categoria: str | None = None,
-                    preco_min: float | None = None, preco_max: float | None = None,
-                    incluir_indisponiveis: bool = False, ordenar: str = "preco_asc",
-                    limite: int = 8) -> dict:
-    store = get_store()
-    category_id = None
-    if categoria:
-        cat = store.category_by_name(categoria)
-        if not cat:
-            return {"erro": f"Categoria '{categoria}' não existe.",
-                    "categorias_validas": [c["nome"] for c in store.categories.values()]}
-        category_id = cat["id"]
-
-    results, exact = store.search(termo, category_id, preco_min, preco_max,
-                                  only_available=not incluir_indisponiveis)
-    if ordenar == "preco_desc":
-        results = sorted(results, key=lambda p: -p.effective_price)
-    limite = max(1, min(int(limite or 8), 20))
-    out: dict[str, Any] = {
-        "total_encontrado": len(results),
-        "mostrando": min(limite, len(results)),
-        "produtos": [product_summary(p) for p in results[:limite]],
-        "filtro_preco_considera": "preço efetivo (promocional, se houver; sem desconto PIX)",
+PRODUCTS: dict[int, dict] = {}
+for _r in _csv("products"):
+    p = {
+        "id": int(_r["product_id"]),
+        "nome": _r["name"],
+        "categoria": CATEGORIES[int(_r["category_id"])],
+        "preco": float(_r["price_brl"]),
+        "estoque": int(_r["stock_quantity"] or 0),
+        "status": _r["status"],
+        "descricao": _r["description"],
+        "specs": json.loads(_r["specs"]) if _r["specs"] else {},
+        "promo": None,               # promoção ativa
+        "promos_encerradas": [],
     }
-    if termo and not exact and results:
-        out["aviso"] = "Nenhum produto atende a TODOS os termos; resultados são correspondências parciais."
-    if not results:
-        out["aviso"] = "Nenhum produto disponível com esses filtros."
-    return out
+    specs = " ".join(f"{k} {v}" for k, v in p["specs"].items()).replace("electronics yes", "eletrico")
+    p["busca"] = _words(f"{p['nome']} {p['categoria']} {p['descricao']} {specs}")
+    p["nome_compacto"] = re.sub(r"[^a-z0-9]", "", _norm(p["nome"]))
+    PRODUCTS[p["id"]] = p
+
+for _r in _csv("promotions"):
+    p = PRODUCTS.get(int(_r["product_id"]))
+    if p:
+        promo = {"campanha": _r["description"], "desconto": float(_r["discount_percent"])}
+        if _r["is_active"] == "1":
+            p["promo"] = promo
+        else:
+            p["promos_encerradas"].append(promo)
+
+# manual de políticas: seções "## [topico] Título"
+_manual = re.sub(r"<!--.*?-->", "", (ROOT / "knowledge" / "politicas.md").read_text(encoding="utf-8"), flags=re.S)
+POLICIES = {k: v.strip() for k, v in re.findall(r"^## \[(\w+)\][^\n]*\n(.*?)(?=^## |\Z)", _manual, re.M | re.S)}
 
 
-def detalhes_produto(produto: str) -> dict:
-    store = get_store()
-    found = store.find_product(str(produto))
-    if not found:
-        return {"erro": f"Nenhum produto encontrado para '{produto}'. Ele pode não fazer parte do catálogo."}
-    if len(found) > 1:
-        return {"ambiguo": True, "mensagem": "Mais de um produto corresponde; peça para o cliente especificar.",
-                "candidatos": [product_summary(p) for p in found[:8]]}
-    p = found[0]
-    out = product_summary(p)
-    out["descricao"] = p.description
-    out["especificacoes"] = {SPEC_KEYS.get(k, k): SPEC_VALUES.get(str(v), v) for k, v in p.specs.items()}
-    if p.past_promos:
-        out["promocoes_encerradas"] = [
-            {"campanha": pr.description, "desconto": f"{pr.discount_percent:g}%"} for pr in p.past_promos
-        ]
-    if not p.sellable:
-        out["alternativas_disponiveis"] = [product_summary(a) for a in store.alternatives(p)]
-    return out
+# ----------------------------------------------------------------------------- regras de negócio
+
+def brl(v: float) -> str:
+    return "R$ " + f"{v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
-def listar_categorias() -> dict:
-    store = get_store()
-    cats = []
-    for c in store.categories.values():
-        n = sum(1 for p in store.products.values() if p.category_id == c["id"] and p.sellable)
-        cats.append({"nome": c["nome"], "descricao": c["descricao"], "produtos_disponiveis": n})
-    return {"categorias": cats}
+def _preco(p: dict) -> float:
+    """preço efetivo: com a promoção ativa, se houver."""
+    return round(p["preco"] * (1 - p["promo"]["desconto"] / 100), 2) if p["promo"] else p["preco"]
 
 
-def listar_promocoes_ativas() -> dict:
-    store = get_store()
-    promos = [product_summary(p) for p in store.products.values() if p.active_promo]
-    return {"promocoes_ativas": promos, "total": len(promos)}
+def _disponibilidade(p: dict) -> str:
+    if p["status"] == "discontinued":
+        return "descontinuado (saiu do catálogo)"
+    if p["status"] == "coming_soon":
+        return "em breve (ainda não está à venda)"
+    return "disponível" if p["estoque"] > 0 else "esgotado no momento"
 
 
-# ----------------------------------------------------------------------------- pagamento / frete
-
-def _min_installment(n: int) -> float:
-    if n == 1:
-        return 0
-    if n <= 3:
-        return 50
-    if n <= 6:
-        return 80
-    return 100
+def _max_parcelas(valor: float) -> int:
+    """maior n (até 12) que respeita a parcela mínima: 2–3x R$ 50, 4–6x R$ 80, 7–12x R$ 100."""
+    minimo = lambda n: 0 if n == 1 else 50 if n <= 3 else 80 if n <= 6 else 100  # noqa: E731
+    return max(n for n in range(1, 13) if valor / n >= minimo(n))
 
 
-def calcular_condicoes_pagamento(valor: float, preco_promocional: bool = False) -> dict:
-    valor = float(valor)
-    if valor <= 0:
-        return {"erro": "Valor deve ser positivo."}
-    parcelas = [
-        {"vezes": n, "parcela": brl(valor / n)}
-        for n in range(1, 13) if valor / n >= _min_installment(n)
-    ]
-    out: dict[str, Any] = {
-        "valor": brl(valor),
-        "cartao_credito": {
-            "max_parcelas_sem_juros": parcelas[-1]["vezes"],
-            "opcoes": parcelas,
-        },
-        "debito_ou_boleto": brl(valor),
-        "combinar_formas_de_pagamento": "permitido" if valor > 2000 else "não permitido (só acima de R$ 2.000,00)",
+def _resumo(p: dict) -> dict:
+    preco = _preco(p)
+    n = _max_parcelas(preco)
+    out = {
+        "id": p["id"],
+        "nome": p["nome"],
+        "categoria": p["categoria"],
+        "disponibilidade": _disponibilidade(p),
+        "preco_tabela": brl(p["preco"]),
     }
-    if preco_promocional:
-        out["pix"] = f"{brl(valor)} (desconto PIX não se aplica sobre preço promocional)"
+    if p["promo"]:
+        out["promocao_ativa"] = f"{p['promo']['campanha']}: {p['promo']['desconto']:g}% off → {brl(preco)} (sem desconto extra no PIX)"
     else:
-        out["pix"] = f"{brl(round(valor * 0.95, 2))} (5% de desconto)"
+        out["preco_no_pix"] = brl(round(preco * 0.95, 2))
+    out["cartao"] = f"até {n}x de {brl(preco / n)} sem juros"
+    if p["promos_encerradas"]:
+        out["promocoes_encerradas"] = [f"{x['campanha']} ({x['desconto']:g}%)" for x in p["promos_encerradas"]]
+    if 0 < p["estoque"] <= 2 and p["status"] == "active":
+        out["estoque"] = "últimas unidades"
+    out["descricao"] = p["descricao"]
+    out["especificacoes"] = p["specs"]
     return out
 
 
-def calcular_frete(valor_pedido: float, cidade: str) -> dict:
-    from .store import norm
-    valor = float(valor_pedido)
-    if norm(cidade).strip() in {"campo grande", "cg"}:
-        return {
-            "regiao": "Campo Grande (entrega por motoboy próprio)",
-            "frete": "grátis" if valor > 500 else brl(35),
-            "regra": "Frete grátis acima de R$ 500,00; até R$ 500,00, taxa fixa de R$ 35,00.",
-            "prazo": "1 a 3 dias úteis",
-        }
+# ----------------------------------------------------------------------------- ferramentas
+
+# Tipos simples (str, float, int, bool) de propósito: o SDK não converte argumentos para
+# Literal nem para "float | None" e a ferramenta falharia. As opções válidas vão na docstring.
+
+def buscar_produtos(termo: str = "", categoria: str = "", preco_max: float = 0, so_promocoes: bool = False) -> dict:
+    """Busca instrumentos no catálogo. Use para qualquer pergunta sobre produto, preço, estoque ou
+    promoção: um modelo específico ("quanto custa o Takamine GD20?"), uma busca aberta ("violões até
+    R$ 1000") ou "tem algo em promoção?" (so_promocoes=true).
+
+    Args:
+        termo: marca, modelo ou característica (ex.: "Yamaha", "GD20", "nylon", "7 cordas").
+        categoria: uma destas: Guitarras, Baixos, Baterias e Percussão, Teclados e Pianos, Violões,
+            Instrumentos de Sopro (Madeiras), Instrumentos de Sopro (Metais), Cordas Orquestrais, Ukuleles.
+        preco_max: preço máximo em reais, 0 = sem limite (considera o preço promocional, sem o desconto do PIX).
+        so_promocoes: só produtos com promoção ativa.
+
+    Retorna `disponiveis` (até 10, do mais barato ao mais caro) e, quando há `termo`, os produtos
+    que batem com ele mas não estão à venda (`indisponiveis`: esgotado, descontinuado, em breve).
+    """
+    if categoria and categoria not in CATEGORIES.values():
+        return {"erro": f"Categoria inválida: {categoria}", "categorias_validas": list(CATEGORIES.values())}
+    pool = [p for p in PRODUCTS.values()
+            if (not categoria or p["categoria"] == categoria)
+            and (not preco_max or _preco(p) <= preco_max)
+            and (not so_promocoes or p["promo"])]
+
+    palavras = _words(termo)
+    if palavras:
+        compacto = re.sub(r"[^a-z0-9]", "", _norm(termo))  # "GD-20" == "gd20"
+        exatos = [p for p in pool if len(compacto) >= 4 and compacto in p["nome_compacto"]]
+        if exatos:
+            pool = exatos
+        else:  # fica com os produtos que batem com mais palavras do termo
+            acertos = {p["id"]: sum(w in p["busca"] or w in p["nome_compacto"] for w in palavras) for p in pool}
+            melhor = max(acertos.values(), default=0)
+            pool = [p for p in pool if melhor and acertos[p["id"]] == melhor]
+
+    pool.sort(key=_preco)
+    disponiveis = [p for p in pool if _disponibilidade(p) == "disponível"]
+    out = {"total_disponiveis": len(disponiveis), "disponiveis": [_resumo(p) for p in disponiveis[:10]]}
+    if palavras:
+        out["indisponiveis"] = [_resumo(p) for p in pool if p not in disponiveis][:5]
+    if not pool:
+        out["aviso"] = "Nenhum produto encontrado com esses filtros."
+    return out
+
+
+def calcular_pagamento(valor: float, preco_promocional: bool = False) -> dict:
+    """Calcula PIX e parcelas no cartão para um VALOR TOTAL (ex.: soma de vários produtos).
+    Para um produto só, o resultado de buscar_produtos já traz PIX e parcelas.
+
+    Args:
+        valor: valor total em reais.
+        preco_promocional: true se o valor já tem desconto de promoção (aí o PIX não dá 5% extra).
+    """
+    n = _max_parcelas(valor)
     return {
-        "regiao": f"Outra cidade ({cidade})",
-        "frete": "sob cotação: depende do CEP, peso e dimensões; a equipe faz o cálculo",
-        "modalidades": [
-            {"modalidade": "PAC (Correios)", "prazo": "5 a 12 dias úteis"},
-            {"modalidade": "SEDEX (Correios)", "prazo": "2 a 5 dias úteis"},
-            {"modalidade": "Jadlog", "prazo": "3 a 8 dias úteis"},
-        ],
-        "obs": "Todos os envios têm rastreamento e seguro. Instrumentos de grande porte "
-               "(baterias acústicas, pianos digitais, contrabaixos) podem exigir frete especial.",
+        "valor": brl(valor),
+        "pix": brl(valor) + " (sem desconto: preço promocional)" if preco_promocional else brl(round(valor * 0.95, 2)),
+        "cartao": f"até {n}x de {brl(valor / n)} sem juros",
+        "debito_ou_boleto": brl(valor),
+        "pode_combinar_formas": valor > 2000,
     }
 
-
-# ----------------------------------------------------------------------------- políticas
 
 def consultar_politicas(topico: str) -> dict:
-    sections = policies.load_sections()
-    if topico not in sections:
-        return {"erro": f"Tópico inválido: {topico}", "topicos_validos": list(sections)}
-    return sections[topico]
+    """Lê uma seção do manual oficial da loja. Use antes de responder sobre endereço, contato,
+    horário, formas de pagamento, trocas/devoluções, frete e prazos de entrega, rastreio, regras de
+    promoção, atendimento (acessórios, reclamações), garantia ou privacidade.
+
+    Args:
+        topico: um destes: sobre_loja, horario, pagamento, trocas_devolucoes, frete_entrega,
+            rastreamento, promocoes, atendimento, garantia, privacidade.
+    """
+    if topico not in POLICIES:
+        return {"erro": f"Tópico inválido: {topico}", "topicos_validos": list(POLICIES)}
+    return {"topico": topico, "texto": POLICIES[topico]}
 
 
-# ----------------------------------------------------------------------------- pedidos
-
-def _order_details(o: Order) -> dict:
-    store = get_store()
-    hoje = config.today()
-    label, explicacao = ORDER_STATUS.get(o.status, (o.status, ""))
-    customer = store.customers[o.customer_id]
-    out: dict[str, Any] = {
-        "numero_pedido": o.order_id,
-        "cliente": customer.name.split()[0],
-        "data_pedido": o.order_date.isoformat(),
-        "status": label,
-        "explicacao_status": explicacao,
-        "itens": [
-            {"produto": store.products[i.product_id].name if i.product_id in store.products else f"#{i.product_id}",
-             "quantidade": i.quantity}
-            for i in o.items
-        ],
-        "total": brl(o.total),
-        "forma_pagamento": payment_label(o.payment_method),
-    }
-    if o.tracking_code:
-        out["codigo_rastreio"] = o.tracking_code
-    if o.notes:
-        out["observacoes"] = o.notes
-
-    if o.status == "shipped" and o.estimated_delivery:
-        out["previsao_entrega"] = o.estimated_delivery.isoformat()
-        if o.estimated_delivery < hoje:
-            out["alerta"] = (f"Previsão de entrega vencida há {(hoje - o.estimated_delivery).days} dias. "
-                             "Oferecer encaminhamento para a equipe verificar com a transportadora.")
-        out["obs_arrependimento"] = "O prazo de 7 dias para arrependimento começa a contar no recebimento."
-    elif o.status == "delivered" and o.estimated_delivery:
-        recebido = o.estimated_delivery
-        dias_receb = (hoje - recebido).days
-        dias_compra = (hoje - o.order_date).days
-
-        def janela(base, dias):
-            fim = base + timedelta(days=dias)
-            return {"prazo_final": fim.isoformat(), "dentro_do_prazo": hoje <= fim}
-
-        out["data_recebimento_considerada"] = recebido.isoformat()
-        out["dias_desde_recebimento"] = dias_receb
-        out["dias_desde_compra"] = dias_compra
-        out["prazos"] = {
-            "arrependimento_7_dias_apos_recebimento": janela(recebido, 7),
-            "troca_por_preferencia_7_dias": janela(recebido, 7),
-            "troca_por_defeito_na_loja_30_dias_apos_compra": janela(o.order_date, 30),
-            "garantia_legal_90_dias_apos_recebimento": janela(recebido, 90),
-        }
-        out["obs_prazos"] = ("Data de recebimento estimada pela previsão de entrega do sistema. "
-                             "Após 30 dias da compra, defeitos são tratados via garantia do fabricante "
-                             "(a loja pode intermediar).")
-    return out
-
-
-def consultar_pedido(contato: str, numero_pedido: int | None = None) -> dict:
-    """`contato` = e-mail ou telefone cadastrado (verificação de identidade, LGPD)."""
-    store = get_store()
-    if not contato or not str(contato).strip():
-        return {"erro": "Informe o e-mail ou telefone cadastrado para verificação."}
-    nao_encontrado = {"erro": "Não encontrei pedido com esses dados. Confira o número do pedido e "
-                              "o e-mail/telefone usados na compra."}
-    if numero_pedido is not None:
-        o = store.orders.get(int(numero_pedido))
-        if not o or not store.customer_matches(store.customers[o.customer_id], str(contato)):
-            return nao_encontrado
-        return _order_details(o)
-
-    customer = store.customer_by_contact(str(contato))
-    if not customer:
-        return nao_encontrado
-    orders = sorted((o for o in store.orders.values() if o.customer_id == customer.customer_id),
-                    key=lambda o: o.order_date, reverse=True)
-    if not orders:
-        return {"mensagem": "Cliente localizado, mas não há pedidos registrados."}
-    return {
-        "cliente": customer.name.split()[0],
-        "pedidos": [{"numero_pedido": o.order_id, "data_pedido": o.order_date.isoformat(),
-                     "status": ORDER_STATUS.get(o.status, (o.status,))[0], "total": brl(o.total)}
-                    for o in orders],
-    }
-
-
-# ----------------------------------------------------------------------------- escalonamento
-
-def encaminhar_para_equipe(motivo: str, resumo: str, contato_cliente: str | None = None,
-                           numero_pedido: int | None = None) -> dict:
-    protocolo = f"EM-{config.today():%Y%m%d}-{uuid.uuid4().hex[:4].upper()}"
-    registro = {
-        "protocolo": protocolo,
-        "registrado_em": config.now().isoformat(),
-        "motivo": motivo,
-        "resumo": resumo,
-        "contato_cliente": contato_cliente,
-        "numero_pedido": numero_pedido,
-    }
-    config.LOGS_DIR.mkdir(exist_ok=True)
-    with open(config.LOGS_DIR / "encaminhamentos.jsonl", "a", encoding="utf-8") as f:
-        f.write(json.dumps(registro, ensure_ascii=False) + "\n")
-    return {"protocolo": protocolo, "prazo_retorno": "até 24 horas úteis", "status": "registrado"}
-
-
-# ----------------------------------------------------------------------------- registro
-
-REGISTRY: dict[str, Callable[..., dict]] = {
-    f.__name__: f for f in [
-        buscar_produtos, detalhes_produto, listar_categorias, listar_promocoes_ativas,
-        calcular_condicoes_pagamento, calcular_frete, consultar_politicas, consultar_pedido,
-        encaminhar_para_equipe,
-    ]
+STATUS = {
+    "pending": "Pendente: aguardando confirmação do pagamento",
+    "confirmed": "Confirmado: pagamento aprovado, em separação",
+    "shipped": "Enviado: a caminho do endereço de entrega",
+    "delivered": "Entregue",
+    "cancelled": "Cancelado",
 }
 
 
-def declarations() -> list[dict]:
-    """Schemas das ferramentas no formato function declaration (JSON Schema)."""
-    store = get_store()
-    cat_names = [c["nome"] for c in store.categories.values()]
-    return [
-        {
-            "name": "buscar_produtos",
-            "description": "Busca instrumentos no catálogo com filtros. Use para perguntas abertas "
-                           "('quais violões até R$ 1000?', 'tem guitarra Fender?'). Retorna preço de "
-                           "tabela, promoção ativa, preço no PIX e disponibilidade REAL de estoque.",
-            "parameters_json_schema": {
-                "type": "object",
-                "properties": {
-                    "termo": {"type": "string", "description": "Palavras-chave: marca, modelo, tipo "
-                              "(ex.: 'nylon', 'elétrico', 'Yamaha', '7 cordas', 'tenor')."},
-                    "categoria": {"type": "string", "enum": cat_names},
-                    "preco_min": {"type": "number"},
-                    "preco_max": {"type": "number", "description": "Preço máximo em reais."},
-                    "incluir_indisponiveis": {"type": "boolean", "description": "Inclui esgotados e "
-                                              "lançamentos futuros. Padrão: false."},
-                    "ordenar": {"type": "string", "enum": ["preco_asc", "preco_desc"]},
-                    "limite": {"type": "integer", "description": "Máx. de itens (padrão 8, máx. 20)."},
-                },
-            },
-        },
-        {
-            "name": "detalhes_produto",
-            "description": "Detalhes de UM produto específico pelo nome/modelo ou id: preço, promoção "
-                           "ativa e encerradas, especificações, estoque e alternativas se indisponível. "
-                           "Use para 'quanto custa o X?', 'tem o X?', 'a promoção do X ainda vale?'.",
-            "parameters_json_schema": {
-                "type": "object",
-                "properties": {"produto": {"type": "string", "description": "Nome, modelo ou id."}},
-                "required": ["produto"],
-            },
-        },
-        {
-            "name": "listar_categorias",
-            "description": "Lista as categorias de instrumentos e quantos produtos há disponíveis em cada.",
-            "parameters_json_schema": {"type": "object", "properties": {}},
-        },
-        {
-            "name": "listar_promocoes_ativas",
-            "description": "Lista todos os produtos com promoção ativa agora.",
-            "parameters_json_schema": {"type": "object", "properties": {}},
-        },
-        {
-            "name": "calcular_condicoes_pagamento",
-            "description": "Calcula preço no PIX, parcelamento máximo sem juros e opções de parcelas "
-                           "para um valor, segundo as regras da loja.",
-            "parameters_json_schema": {
-                "type": "object",
-                "properties": {
-                    "valor": {"type": "number", "description": "Valor total em reais."},
-                    "preco_promocional": {"type": "boolean", "description": "true se o valor já é "
-                                          "preço promocional (PIX não acumula desconto)."},
-                },
-                "required": ["valor"],
-            },
-        },
-        {
-            "name": "calcular_frete",
-            "description": "Informa frete e prazo de entrega para um valor de pedido e cidade de destino.",
-            "parameters_json_schema": {
-                "type": "object",
-                "properties": {
-                    "valor_pedido": {"type": "number"},
-                    "cidade": {"type": "string"},
-                },
-                "required": ["valor_pedido", "cidade"],
-            },
-        },
-        {
-            "name": "consultar_politicas",
-            "description": "Consulta o manual oficial de políticas da loja por tópico. Use SEMPRE antes "
-                           "de responder sobre: endereço/contato, horário, pagamento, trocas/devoluções, "
-                           "frete, rastreamento, regras de promoção, garantia, privacidade, escopo de "
-                           "atendimento.",
-            "parameters_json_schema": {
-                "type": "object",
-                "properties": {"topico": {"type": "string", "enum": policies.topics()}},
-                "required": ["topico"],
-            },
-        },
-        {
-            "name": "consultar_pedido",
-            "description": "Consulta status, itens, rastreio e prazos (devolução/troca/garantia já "
-                           "calculados) de pedidos. Exige o e-mail OU telefone cadastrado do cliente. "
-                           "Sem número do pedido, lista os pedidos do cliente.",
-            "parameters_json_schema": {
-                "type": "object",
-                "properties": {
-                    "contato": {"type": "string", "description": "E-mail ou telefone informado pelo cliente."},
-                    "numero_pedido": {"type": "integer"},
-                },
-                "required": ["contato"],
-            },
-        },
-        {
-            "name": "encaminhar_para_equipe",
-            "description": "Registra um atendimento para a equipe humana e gera protocolo. Use para: "
-                           "reclamações, pedidos de devolução/troca/cancelamento, atraso de entrega, "
-                           "cotação de frete para outras cidades, ou quando o cliente pedir um humano. "
-                           "Confirme com o cliente antes de registrar.",
-            "parameters_json_schema": {
-                "type": "object",
-                "properties": {
-                    "motivo": {"type": "string", "enum": [
-                        "reclamacao", "devolucao_ou_troca", "cancelamento", "atraso_entrega",
-                        "cotacao_frete", "garantia", "atendimento_humano", "outro"]},
-                    "resumo": {"type": "string", "description": "Resumo objetivo do caso para a equipe."},
-                    "contato_cliente": {"type": "string"},
-                    "numero_pedido": {"type": "integer"},
-                },
-                "required": ["motivo", "resumo"],
-            },
-        },
-    ]
+def _contato_confere(cliente: dict, contato: str) -> bool:
+    if "@" in contato:
+        return _norm(contato.strip()) == _norm(cliente["email"])
+    digitos = re.sub(r"\D", "", contato)
+    return len(digitos) >= 8 and re.sub(r"\D", "", cliente["phone"]).endswith(digitos[-9:])
 
 
-def execute(name: str, args: dict | None) -> dict:
-    fn = REGISTRY.get(name)
-    if not fn:
-        return {"erro": f"Ferramenta desconhecida: {name}"}
-    try:
-        return fn(**(args or {}))
-    except TypeError as e:
-        return {"erro": f"Argumentos inválidos para {name}: {e}"}
-    except Exception as e:  # nunca derrubar a conversa por erro de ferramenta
-        return {"erro": f"Falha ao executar {name}: {e}"}
+def _pagamento(codigo: str) -> str:
+    if codigo.startswith("credit_"):
+        return f"cartão de crédito em {codigo[7:].rstrip('x')}x"
+    return {"pix": "PIX", "debit": "cartão de débito", "boleto": "boleto"}.get(codigo, codigo)
+
+
+def consultar_pedido(numero_pedido: int, contato: str) -> dict:
+    """Status, itens, rastreio e prazos de devolução/troca/garantia (já calculados) de um pedido.
+    Exige o número do pedido E o e-mail ou telefone cadastrado (política de privacidade): peça os
+    dois ao cliente antes de chamar.
+
+    Args:
+        numero_pedido: número do pedido.
+        contato: e-mail ou telefone informado pelo cliente.
+    """
+    o = ORDERS.get(int(numero_pedido))
+    if not o or not _contato_confere(CUSTOMERS[int(o["customer_id"])], contato):
+        # mesma mensagem para "não existe" e "não é seu", para não revelar pedidos de terceiros
+        return {"erro": "Não encontrei pedido com esses dados. Confira o número e o e-mail/telefone da compra."}
+    hoje = now().date()
+    compra = date.fromisoformat(o["order_date"])
+    previsao = date.fromisoformat(o["estimated_delivery"]) if o["estimated_delivery"] else None
+    out = {
+        "numero": numero_pedido,
+        "cliente": CUSTOMERS[int(o["customer_id"])]["name"].split()[0],
+        "data_compra": compra.isoformat(),
+        "status": STATUS[o["status"]],
+        "itens": [f"{i['quantity']}x {PRODUCTS[int(i['product_id'])]['nome']}" for i in o["items"]],
+        "total": brl(float(o["total_brl"])),
+        "pagamento": _pagamento(o["payment_method"]),
+        "rastreio": o["tracking_code"] or None,
+        "observacoes": o["notes"] or None,
+    }
+    if o["status"] == "shipped" and previsao:
+        out["previsao_entrega"] = previsao.isoformat()
+        if previsao < hoje:
+            out["alerta"] = f"Previsão de entrega vencida há {(hoje - previsao).days} dias: ofereça encaminhar para a equipe."
+    if o["status"] == "delivered" and previsao:
+        def prazo(base: date, dias: int) -> str:
+            fim = base + timedelta(days=dias)
+            return f"até {fim:%d/%m/%Y} ({'dentro' if hoje <= fim else 'fora'} do prazo)"
+        out["recebido_em"] = f"{previsao.isoformat()} (considerada a previsão de entrega; o sistema não registra a data real)"
+        out["prazos"] = {
+            "arrependimento_ou_troca_por_preferencia (7 dias do recebimento)": prazo(previsao, 7),
+            "troca_por_defeito_na_loja (30 dias da compra)": prazo(compra, 30),
+            "garantia_legal (90 dias do recebimento)": prazo(previsao, 90),
+        }
+    return out
+
+
+def encaminhar_para_equipe(motivo: str, resumo: str, contato_cliente: str = "", numero_pedido: int = 0) -> dict:
+    """Registra o caso para a equipe humana e gera um protocolo. Use para reclamação, devolução,
+    troca, cancelamento, atraso, cotação de frete para outra cidade ou quando o cliente pedir um
+    humano. Confirme com o cliente antes de registrar.
+
+    Args:
+        motivo: reclamacao, devolucao_ou_troca, cancelamento, atraso_entrega, cotacao_frete, garantia,
+            atendimento_humano ou outro.
+        resumo: resumo objetivo do caso para a equipe.
+        contato_cliente: e-mail ou telefone do cliente.
+        numero_pedido: número do pedido, 0 se não houver.
+    """
+    protocolo = f"EM-{now():%Y%m%d}-{uuid.uuid4().hex[:4].upper()}"
+    LOGS_DIR.mkdir(exist_ok=True)
+    with open(LOGS_DIR / "encaminhamentos.jsonl", "a", encoding="utf-8") as f:
+        f.write(json.dumps({"protocolo": protocolo, "em": now().isoformat(), "motivo": motivo, "resumo": resumo,
+                            "contato": contato_cliente, "pedido": numero_pedido or None}, ensure_ascii=False) + "\n")
+    return {"protocolo": protocolo, "prazo_retorno": "até 24 horas úteis"}
+
+
+TOOLS = [buscar_produtos, calcular_pagamento, consultar_politicas, consultar_pedido, encaminhar_para_equipe]

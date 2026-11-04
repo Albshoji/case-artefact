@@ -1,149 +1,155 @@
-"""Testes determinísticos das ferramentas (não chamam o LLM)."""
+"""Testes das ferramentas (sem rede, sem LLM)."""
 
 import pytest
+from google.genai import types
 
 from emporio import tools
+from emporio.prompts import store_status
 
 
 @pytest.fixture(autouse=True)
 def fixed_date(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_TODAY", "2026-03-25")
-    monkeypatch.setattr(tools.config, "LOGS_DIR", tmp_path)
+    monkeypatch.setattr(tools, "LOGS_DIR", tmp_path)
 
 
-def names(result):
-    return [p["nome"] for p in result["produtos"]]
+def nomes(r, campo="disponiveis"):
+    return [p["nome"] for p in r[campo]]
 
 
 # ------------------------------------------------------------------ catálogo
 
-def test_violoes_ate_1000_somente_disponiveis():
-    r = tools.buscar_produtos(categoria="Violões", preco_max=1000, limite=20)
-    assert r["total_encontrado"] == 12
-    assert "Giannini GF-3D Dreadnought Sunburst" not in names(r)  # estoque 0
-    assert "Shelby SN-7C 7 Cordas Nylon Natural" not in names(r)  # descontinuado
+def test_violoes_ate_1000_so_disponiveis():
+    r = tools.buscar_produtos(categoria="Violões", preco_max=1000)
+    assert r["total_disponiveis"] == 12
+    assert "Giannini GF-3D Dreadnought Sunburst" not in nomes(r)  # estoque 0
+    assert "Shelby SN-7C 7 Cordas Nylon Natural" not in nomes(r)  # descontinuado
 
 
-def test_preco_takamine_gd20_sem_promocao_ativa():
-    r = tools.detalhes_produto("Takamine GD-20")
-    assert r["nome"] == "Takamine GD20 Dreadnought Natural"
-    assert r["preco_tabela"] == "R$ 2.199,00"
-    assert "promocao_ativa" not in r
-    assert r["preco_no_pix"] == "R$ 2.089,05"
-    assert r["promocoes_encerradas"][0]["campanha"] == "Oferta Especial"
+def test_preco_takamine_gd20_e_promocao_encerrada():
+    p = tools.buscar_produtos("Takamine GD-20")["disponiveis"][0]
+    assert p["nome"] == "Takamine GD20 Dreadnought Natural"
+    assert p["preco_tabela"] == "R$ 2.199,00"
+    assert p["preco_no_pix"] == "R$ 2.089,05"
+    assert "promocao_ativa" not in p
+    assert p["promocoes_encerradas"]
 
 
-def test_promocao_ativa_aplicada_e_pix_nao_cumulativo():
-    r = tools.detalhes_produto("Ohana CK-20")
-    assert r["promocao_ativa"]["preco_promocional"] == "R$ 439,20"
-    assert "preco_no_pix" not in r
+def test_promocao_ativa_sem_pix():
+    p = tools.buscar_produtos("Ohana CK-20")["disponiveis"][0]
+    assert "R$ 439,20" in p["promocao_ativa"]
+    assert "preco_no_pix" not in p
 
 
 def test_filtro_de_preco_usa_preco_promocional():
-    # Crafter HT-100 custa 2399, mas está com 18% off -> 1967,18
-    r = tools.buscar_produtos(termo="Crafter", preco_max=2000)
-    assert "Crafter HT-100 Folk Aço Natural" in names(r)
+    # Crafter HT-100 custa 2399, com 18% off sai 1967,18
+    assert "Crafter HT-100 Folk Aço Natural" in nomes(tools.buscar_produtos("Crafter", preco_max=2000))
 
 
-def test_produto_esgotado_sugere_alternativas():
-    r = tools.detalhes_produto("Giannini GF-3D")
-    assert r["disponibilidade"].startswith("esgotado")
-    assert len(r["alternativas_disponiveis"]) == 3
-    assert all(a["disponibilidade"] == "disponível" for a in r["alternativas_disponiveis"])
+def test_produto_esgotado_aparece_como_indisponivel():
+    r = tools.buscar_produtos("Giannini GF-3D")
+    assert r["indisponiveis"][0]["disponibilidade"] == "esgotado no momento"
 
 
-def test_produto_em_breve_nao_e_vendavel():
-    r = tools.detalhes_produto("Kala KA-ABP-CTG")
-    assert r["disponibilidade"].startswith("em breve")
+def test_produto_em_breve():
+    r = tools.buscar_produtos("Kala KA-ABP-CTG")
+    assert r["indisponiveis"][0]["disponibilidade"].startswith("em breve")
 
 
 def test_produto_inexistente():
-    assert "erro" in tools.detalhes_produto("Stradivarius 1715")
+    assert "aviso" in tools.buscar_produtos("Stradivarius 1715")
 
 
-def test_nome_ambiguo():
-    r = tools.detalhes_produto("Martin D-28")
-    assert r.get("ambiguo") or r["nome"].startswith("Martin")
-
-
-def test_categorias_sem_estoque():
-    cats = {c["nome"]: c["produtos_disponiveis"] for c in tools.listar_categorias()["categorias"]}
-    assert cats["Cordas Orquestrais"] == 0
-    assert cats["Violões"] > 0
+def test_categoria_sem_produtos():
+    assert tools.buscar_produtos(categoria="Cordas Orquestrais")["total_disponiveis"] == 0
 
 
 def test_promocoes_ativas():
-    assert tools.listar_promocoes_ativas()["total"] == 4
+    assert tools.buscar_produtos(so_promocoes=True)["total_disponiveis"] == 4
 
 
-# ------------------------------------------------------------------ pagamento / frete
+# ------------------------------------------------------------------ pagamento
 
-@pytest.mark.parametrize("valor,max_n", [(2199, 12), (599, 6), (159.9, 3), (90, 1), (1000, 10)])
-def test_parcelamento(valor, max_n):
-    r = tools.calcular_condicoes_pagamento(valor)
-    assert r["cartao_credito"]["max_parcelas_sem_juros"] == max_n
-
-
-def test_combinacao_pagamento_acima_de_2000():
-    assert tools.calcular_condicoes_pagamento(2500)["combinar_formas_de_pagamento"] == "permitido"
-    assert "não" in tools.calcular_condicoes_pagamento(1500)["combinar_formas_de_pagamento"]
+@pytest.mark.parametrize("valor,parcelas", [(2199, 12), (599, 6), (159.9, 3), (90, 1), (1000, 10)])
+def test_parcelamento(valor, parcelas):
+    assert tools.calcular_pagamento(valor)["cartao"].startswith(f"até {parcelas}x")
 
 
-def test_frete():
-    assert tools.calcular_frete(600, "Campo Grande")["frete"] == "grátis"
-    assert tools.calcular_frete(400, "campo grande")["frete"] == "R$ 35,00"
-    assert "cotação" in tools.calcular_frete(600, "Dourados")["frete"]
+def test_pix_e_combinacao():
+    assert tools.calcular_pagamento(1000)["pix"] == "R$ 950,00"
+    assert "sem desconto" in tools.calcular_pagamento(1000, preco_promocional=True)["pix"]
+    assert tools.calcular_pagamento(2500)["pode_combinar_formas"] is True
+    assert tools.calcular_pagamento(1500)["pode_combinar_formas"] is False
 
 
 # ------------------------------------------------------------------ políticas
 
-def test_politicas_por_topico():
-    r = tools.consultar_politicas("horario")
-    assert "09:00 às 18:00" in r["conteudo"]
-    assert "erro" in tools.consultar_politicas("inexistente")
-    assert "3341-4444" in tools.consultar_politicas("sobre_loja")["conteudo"]
+def test_politicas():
+    assert len(tools.POLICIES) == 10
+    assert "09:00 às 18:00" in tools.consultar_politicas("horario")["texto"]
+    assert "3341-4444" in tools.consultar_politicas("sobre_loja")["texto"]
+    assert "topicos_validos" in tools.consultar_politicas("inexistente")
+    assert "categorias_validas" in tools.buscar_produtos(categoria="Violinos")
 
 
 # ------------------------------------------------------------------ pedidos
 
 def test_pedido_exige_contato_correto():
-    assert "erro" in tools.consultar_pedido("outra.pessoa@jmail.com", 1)
-    r = tools.consultar_pedido("pedro.oliveira@jmail.com", 1)
+    assert "erro" in tools.consultar_pedido(1, "outra.pessoa@jmail.com")
+    assert "erro" in tools.consultar_pedido(999, "pedro.oliveira@jmail.com")
+    r = tools.consultar_pedido(1, "pedro.oliveira@jmail.com")
     assert r["status"] == "Entregue"
     assert r["cliente"] == "Pedro"
+    assert r["pagamento"] == "PIX"
 
 
-def test_pedido_por_telefone_sem_ddd():
-    r = tools.consultar_pedido("99654-7821", 8)
-    assert r["status"] == "Enviado"
-    assert "alerta" in r  # previsão 28/02 vencida em 25/03
+def test_pedido_por_telefone_sem_ddd_e_atraso():
+    r = tools.consultar_pedido(8, "99654-7821")
+    assert r["status"].startswith("Enviado")
+    assert "vencida" in r["alerta"]  # previsão 28/02, hoje 25/03
 
 
-def test_lista_pedidos_do_cliente():
-    r = tools.consultar_pedido("pedro.oliveira@jmail.com")
-    assert [p["numero_pedido"] for p in r["pedidos"]] == [19, 1]
-
-
-def test_prazos_de_devolucao_calculados():
-    store = tools.get_store()
-    cust = store.customers[store.orders[7].customer_id]
-    r = tools.consultar_pedido(cust.email, 7)  # entregue em 17/02/2026, hoje 25/03/2026
-    assert r["dias_desde_recebimento"] == 36
-    assert r["prazos"]["arrependimento_7_dias_apos_recebimento"]["dentro_do_prazo"] is False
-    assert r["prazos"]["troca_por_defeito_na_loja_30_dias_apos_compra"]["dentro_do_prazo"] is False
-    assert r["prazos"]["garantia_legal_90_dias_apos_recebimento"]["dentro_do_prazo"] is True
+def test_prazos_de_devolucao():
+    r = tools.consultar_pedido(7, "leticia.rocha@jmail.com")  # recebido 17/02, hoje 25/03
+    prazos = list(r["prazos"].values())
+    assert "fora" in prazos[0] and "fora" in prazos[1] and "dentro" in prazos[2]
 
 
 def test_encaminhamento_gera_protocolo(tmp_path):
-    r = tools.encaminhar_para_equipe("reclamacao", "Cliente reclamou de atraso", "x@y.com", 8)
+    r = tools.encaminhar_para_equipe("reclamacao", "Atraso na entrega", "x@y.com", 8)
     assert r["protocolo"].startswith("EM-20260325-")
     assert (tmp_path / "encaminhamentos.jsonl").exists()
 
 
-def test_execute_trata_erros():
-    assert "erro" in tools.execute("nao_existe", {})
-    assert "erro" in tools.execute("detalhes_produto", {"parametro_errado": 1})
+# ------------------------------------------------------------------ integração com o SDK e prompt
+
+def test_sdk_gera_schema_de_todas_as_ferramentas():
+    for fn in tools.TOOLS:
+        decl = types.FunctionDeclaration.from_callable_with_api_option(callable=fn, api_option="GEMINI_API")
+        assert decl.name == fn.__name__ and decl.description
 
 
-def test_declarations_cobrem_registry():
-    assert {d["name"] for d in tools.declarations()} == set(tools.REGISTRY)
+@pytest.mark.parametrize("fn,args", [
+    (tools.buscar_produtos, {"categoria": "Violões", "preco_max": 1000}),       # número inteiro vindo do modelo
+    (tools.buscar_produtos, {"termo": "Takamine GD20", "preco_max": 999.9}),
+    (tools.buscar_produtos, {"so_promocoes": True}),
+    (tools.calcular_pagamento, {"valor": 2500, "preco_promocional": False}),
+    (tools.consultar_politicas, {"topico": "garantia"}),
+    (tools.consultar_pedido, {"numero_pedido": 7, "contato": "leticia.rocha@jmail.com"}),
+    (tools.consultar_pedido, {"numero_pedido": 7.0, "contato": "leticia.rocha@jmail.com"}),
+    (tools.encaminhar_para_equipe, {"motivo": "atraso_entrega", "resumo": "Pedido 8 atrasado", "numero_pedido": 8}),
+])
+def test_ferramentas_pelo_caminho_do_sdk(fn, args):
+    """Executa como o SDK executa (conversão de argumentos incluída): nenhum erro pode escapar."""
+    from google.genai import _extra_utils
+    result = _extra_utils.invoke_function_from_dict_args(
+        _extra_utils.convert_number_values_for_dict_function_call_args(args), fn)
+    assert "erro" not in result
+
+
+def test_status_da_loja():
+    from datetime import datetime
+    tz = tools.TZ
+    assert store_status(datetime(2026, 3, 25, 10, 30, tzinfo=tz)).startswith("ABERTA")
+    assert "segunda-feira" in store_status(datetime(2026, 3, 28, 14, 0, tzinfo=tz))  # sábado à tarde
+    assert "amanhã" in store_status(datetime(2026, 3, 29, 10, 0, tzinfo=tz))         # domingo

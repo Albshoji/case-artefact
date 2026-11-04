@@ -45,7 +45,7 @@ Regras de parcelamento no cartão de crédito (todas sem juros):
 - 7x a 12x: parcela mínima de R$ 100,00.
 - Combinação de formas de pagamento (ex.: PIX + cartão) é permitida apenas para compras acima de R$ 2.000,00.
 
-Para calcular parcelas e preço no PIX de um valor específico, use a ferramenta `calcular_condicoes_pagamento`.
+Para calcular parcelas e preço no PIX de um valor específico, use a ferramenta `calcular_pagamento`.
 
 ## [trocas_devolucoes] Trocas e devoluções
 
@@ -150,4 +150,12 @@ Notas de curadoria (inconsistências do PDF original):
    Adotadas as faixas da 3.1 (mais específicas), interpretando a regra até 3x como parcela mínima de R$ 50,00.
 4. A regra de verificação de identidade para pedidos (última linha de [privacidade]) é uma
    decisão de projeto derivada da LGPD, não um texto literal do manual.
+5. Frete em Campo Grande: o PDF diz "grátis acima de R$ 500" e "R$ 35 abaixo de R$ 500", sem dizer o
+   que acontece com exatamente R$ 500,00. Adotado: até R$ 500,00 paga a taxa.
+6. Troca por preferência: o PDF diz "em até 7 dias" sem dizer a partir de quando. Adotado: a partir do
+   recebimento, igual ao direito de arrependimento.
+7. Direito de arrependimento vale para compras online; o sistema não informa o canal da compra.
+   Adotado: todos os pedidos do sistema são tratados como compras online.
+8. O PDF fala em "mais de 300 instrumentos", mas o catálogo do sistema tem 65 produtos; o número foi
+   omitido para o agente não contradizer o catálogo.
 -->
