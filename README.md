@@ -74,9 +74,6 @@ São 4 arquivos de código em `emporio/`:
 - `agent.py`: chamada ao Gemini, troca para o modelo reserva e histórico salvo em JSON;
 - `__main__.py`: o chat no terminal.
 
-Tem uma explicação mais detalhada, trecho por trecho, em
-[`docs/explicacao_do_codigo.md`](docs/explicacao_do_codigo.md).
-
 As ferramentas:
 
 - `buscar_produtos`: qualquer pergunta de produto (um modelo específico, busca por categoria e preço
@@ -329,37 +326,43 @@ Com mais tempo, eu faria:
 
 ## Uso de assistentes de código
 
-Usei o Claude Code (a CLI da Anthropic, com o modelo Claude Opus 5.5) como par de programação no projeto
-todo. Foi mais ou menos assim:
+Usei o Claude Code (CLI da Anthropic, modelo Claude Opus 5.5) como par de programação do começo ao fim.
+A divisão foi: eu defini o problema, tomei as decisões e conferi os resultados; o assistente leu os
+materiais, escreveu a maior parte do código e da documentação e rodou testes e conversas para eu revisar.
 
-1. O Claude Code leu o enunciado, o manual e os CSVs e listou as inconsistências (produto `coming_soon` em
-   pedido, totais que não batem, telefone e e-mail diferentes no manual, regras de parcelamento em
-   conflito).
-2. Discutimos a arquitetura (function calling, RAG ou SQL), e eu escolhi o Gemini por causa do free tier.
-3. A implementação foi por etapas, com um commit em cada uma: dados, ferramentas com testes, prompt e
-   agente, terminal, exemplos e README.
-4. Rodei os testes e conversas reais, conferi se os valores citados batiam com os dados e ajustei o prompt
-   e as ferramentas onde o comportamento não estava bom.
-5. Com a primeira versão funcionando, pedi para simplificar o máximo possível sem perder precisão. O laço
-   de function calling que eu tinha escrito à mão foi trocado pelo automático do SDK, as ferramentas foram
-   de 9 para 5 e o código do agente caiu de umas 1.280 para umas 600 linhas. Para garantir que a busca não
-   piorou, comparei a versão antiga e a nova em 15 buscas típicas. Na primeira tentativa a nova perdia
-   produtos (sinônimos como "eletroacústico" e "clássico"), e corrigi antes de seguir.
-6. Numa revisão final, relemos o enunciado, o manual e os dados linha a linha. Apareceram inconsistências
-   que tinham passado (produtos 135 a 144, parcelas dos pedidos 9, 16 e 18, o e-mail repetido) e uma
-   falha de privacidade: dava para listar os pedidos de um cliente só com o e-mail. Agora a consulta pede
-   o número do pedido e o contato, como o manual curado diz.
-7. Gerando os exemplos de novo, descobri que três ferramentas falhavam quando o modelo chamava, porque o
-   SDK não converte argumentos para `Literal` (o tópico da política, por exemplo) nem um inteiro para
-   `float | None` (`preco_max: 1000`). Os testes chamavam as funções direto e não pegaram isso. Troquei
-   para tipos simples e adicionei testes que rodam cada ferramenta do mesmo jeito que o SDK roda. A lição
-   foi testar a integração com o SDK, não só as funções.
-8. Por fim, reescrevi o código num estilo mais direto (nomes em português, menos comentários, laços simples
-   no lugar de expressões compactas), sem mudar o comportamento.
+Como trabalhei:
 
-O assistente acelerou bastante a escrita de código e de documentação. As decisões de produto (persona,
-como tratar as inconsistências, o que fica fora do escopo, quando passar para um humano) foram revisadas
-por mim.
+1. Análise antes do código. Pedi para o assistente ler o enunciado, o manual e os CSVs e listar o que não
+   batia (produto `coming_soon` em pedido, totais divergentes, telefone e e-mail diferentes no manual,
+   regras de parcelamento em conflito). As decisões sobre cada caso foram minhas e estão neste README.
+2. Arquitetura discutida, não aceita pronta. Comparamos function calling, RAG e text-to-SQL, e eu escolhi
+   function calling com as regras em Python e o Gemini pelo free tier, pelos motivos da seção de decisões.
+3. Implementação em etapas, com um commit por etapa: dados, ferramentas com testes, prompt e agente,
+   terminal, exemplos e README.
+4. Nada de confiar na resposta do modelo sem conferir. Rodei conversas reais, conferi cada preço, parcela
+   e prazo citado contra os CSVs, e ajustei prompt e ferramentas quando algo não estava bom (a seção
+   "O que vi revisando as conversas" mostra o que ainda não está perfeito).
+5. Simplificar depois de funcionar. Com a primeira versão pronta, pedi a solução mais simples possível
+   sem perder precisão. O laço de function calling escrito à mão virou o automático do SDK, as
+   ferramentas foram de 9 para 5 e o código do agente caiu de umas 1.280 para umas 600 linhas. Para não
+   perder qualidade, comparei a busca antiga e a nova em 15 consultas típicas. A primeira tentativa perdia
+   produtos (sinônimos como "eletroacústico" e "clássico"), e só segui depois de corrigir.
+6. Revisão completa no final. Relemos enunciado, manual e dados linha a linha. Apareceram inconsistências
+   que tinham passado (produtos 135 a 144, parcelas dos pedidos 9, 16 e 18, e-mail repetido) e uma falha de
+   privacidade: dava para listar os pedidos de um cliente só com o e-mail. Agora a consulta exige o número
+   do pedido e o contato.
+7. Um bug que os testes não pegaram. Ao gerar os exemplos de novo, três ferramentas falhavam quando o
+   modelo chamava, porque o SDK não converte argumentos para `Literal` nem um inteiro para `float | None`.
+   Os testes chamavam as funções direto, então passavam. Troquei para tipos simples e criei testes que
+   rodam cada ferramenta pelo mesmo caminho do SDK. A lição: com código gerado por IA, testar a integração
+   real e não só as funções isoladas.
+8. Legibilidade. Por fim, pedi para reescrever o código num estilo mais direto (nomes em português, menos
+   comentários, laços simples), sem mudar o comportamento; os testes garantiram isso.
+
+O que funcionou bem: o assistente acelerou muito a leitura dos materiais, a escrita e os testes. O que
+exigiu atenção: ele às vezes entrega algo que parece certo e não está (o bug do SDK, a busca que perdia
+produtos), então toda mudança passou por teste, comparação com os dados ou leitura das conversas antes de
+entrar.
 
 ## Estrutura do repositório
 
@@ -367,7 +370,6 @@ por mim.
 data/                      dados do desafio (CSVs e manual em PDF)
 knowledge/politicas.md     manual convertido e revisado, por tópico
 emporio/                   código do agente (__main__.py, agent.py, prompts.py, tools.py)
-docs/                      explicação do código
 examples/                  conversas de exemplo geradas pelo agente
 scripts/gerar_exemplos.py
 tests/                     pytest, sem rede

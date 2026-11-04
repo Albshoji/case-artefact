@@ -7,3 +7,6 @@ __pycache__/
 logs/
 # enunciado do desafio (não faz parte da solução)
 desafio_tecnico_ai_eng_artefact.pdf
+
+# explicação do código feita para estudo pessoal
+docs/
