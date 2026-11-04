@@ -5,7 +5,7 @@ instrumentos musicais em Campo Grande/MS. O agente ("Tom") responde dúvidas rec
 catálogo, preços, promoções, status de pedido, trocas e devoluções, horários, pagamento e frete.
 Ele decide sozinho quando consultar **dados** (CSVs) e quando consultar **políticas** (manual em PDF).
 
-- **Abordagem:** agente com *function calling* (tool use) e 9 ferramentas determinísticas em Python
+- **Abordagem:** agente com *function calling* automático do SDK do Gemini e 5 ferramentas em Python
 - **Modelo:** Google Gemini 3.5 Flash (free tier do Google AI Studio), com modelos reserva em caso de sobrecarga
 - **Interface:** CLI com histórico persistente por sessão
 - **Exemplos de conversa:** [`examples/`](examples/)
@@ -48,7 +48,7 @@ python -m emporio --debug          # mostra as ferramentas chamadas e o que reto
 python -m emporio --sessao maria   # cria/retoma a conversa "maria" (histórico salvo em .sessions/)
 ```
 
-Comandos dentro do chat: `/nova` (reinicia a conversa), `/debug` (liga/desliga o rastro de ferramentas), `/sair`.
+Comandos dentro do chat: `/nova` (reinicia a conversa) e `/sair`.
 
 ### Variáveis de ambiente (`.env`)
 
@@ -63,7 +63,7 @@ Comandos dentro do chat: `/nova` (reinicia a conversa), `/debug` (liga/desliga o
 ### Testes e exemplos
 
 ```bash
-pytest                             # 31 testes, sem rede (ferramentas + loop do agente com modelo falso)
+pytest                             # 33 testes, sem rede (ferramentas + agente com chat falso)
 python scripts/gerar_exemplos.py   # regenera examples/*.md rodando o agente de verdade
 ```
 
@@ -72,44 +72,41 @@ python scripts/gerar_exemplos.py   # regenera examples/*.md rodando o agente de 
 ## Arquitetura
 
 ```
-                    ┌────────────────────────────────────────────────┐
- Cliente ──texto──▶ │ CLI (emporio/cli.py)                           │
-                    │   └─ Agent.send()  (emporio/agent.py)          │
-                    │        │  histórico + system prompt dinâmico   │
-                    │        ▼                                       │
-                    │   Gemini 3.5 Flash ──function call──┐          │
-                    │        ▲                            ▼          │
-                    │        └──── resultado JSON ── tools.execute() │
-                    └───────────────────────────────────┬────────────┘
-                                                        │
-          ┌──────────────────────────┬──────────────────┼─────────────────────┐
-          ▼                          ▼                  ▼                     ▼
-   store.py (CSVs)          policies.py (manual)   cálculos de regra     logs/encaminhamentos.jsonl
-   produtos, promoções,     knowledge/politicas.md  PIX, parcelas, frete,  (handoff p/ equipe humana)
-   pedidos, clientes        10 seções por tópico    prazos de devolução
+Cliente ──texto──▶ __main__.py (CLI) ──▶ Agent.send()  (agent.py)
+                                            │  histórico + system prompt com data/hora
+                                            ▼
+                                  Gemini (SDK google-genai)
+                                  chama as ferramentas sozinho,
+                                  até 8 rodadas por mensagem
+                                            │
+                                            ▼
+                         tools.py: CSVs + knowledge/politicas.md
+                         (preço, PIX, parcelas, prazos, verificação de identidade)
 ```
+
+São 4 arquivos de código:
 
 | Arquivo | Responsabilidade |
 |---|---|
-| `emporio/store.py` | Carrega e normaliza os CSVs; preço efetivo, disponibilidade, busca tolerante a acentos/plurais/modelos (`GD-20` = `GD20`), verificação de cliente |
-| `emporio/tools.py` | As 9 ferramentas expostas ao LLM + seus schemas |
-| `emporio/policies.py` + `knowledge/politicas.md` | Manual de políticas estruturado por tópico |
-| `emporio/prompts.py` | Persona, regras e contexto temporal (data, hora, loja aberta/fechada) |
-| `emporio/agent.py` | Loop de function calling, retries, persistência do histórico |
-| `emporio/cli.py` | Interface de terminal |
+| `emporio/tools.py` | Carrega os CSVs e o manual; as 5 ferramentas e as regras de negócio |
+| `emporio/prompts.py` | Persona, regras e contexto de data/hora (loja aberta ou fechada) |
+| `emporio/agent.py` | Chamada ao Gemini, modelos reserva e histórico salvo em JSON |
+| `emporio/__main__.py` | Chat no terminal |
 
 ### Ferramentas
 
+As ferramentas são funções Python comuns. O SDK do Gemini gera o schema a partir da assinatura
+(tipos e valores padrão) e da docstring, então não há schema escrito à mão. Os parâmetros usam só tipos
+simples (`str`, `float`, `int`, `bool`): o SDK não converte argumentos para `Literal` nem para `float | None`,
+e a ferramenta falhava (veja "Uso de assistentes de código"). As opções válidas ficam na docstring e a
+ferramenta devolve a lista certa quando recebe um valor inválido.
+
 | Ferramenta | Quando o agente usa |
 |---|---|
-| `buscar_produtos` | Buscas abertas com filtros (categoria, termo, faixa de preço, só disponíveis) |
-| `detalhes_produto` | Produto específico: preço, promoção ativa/encerrada, specs, alternativas se indisponível |
-| `listar_categorias` | "O que vocês vendem?" / checar se há estoque numa categoria (ex.: violino) |
-| `listar_promocoes_ativas` | "Tem alguma promoção?" |
-| `calcular_condicoes_pagamento` | Preço no PIX e parcelamento máximo segundo as regras de parcela mínima |
-| `calcular_frete` | Frete e prazo (Campo Grande: regra fixa; outras cidades: modalidades + cotação) |
-| `consultar_politicas` | Endereço, horário, pagamento, trocas, frete, rastreio, promoções, garantia, LGPD |
-| `consultar_pedido` | Status, itens, rastreio e **prazos de devolução/troca/garantia já calculados** — exige e-mail ou telefone |
+| `buscar_produtos` | Qualquer pergunta de produto: modelo específico, busca com filtros (categoria, preço máximo), promoções ativas. Já devolve preço, promoção ativa/encerrada, PIX, parcelas, disponibilidade e especificações |
+| `calcular_pagamento` | PIX e parcelas para um total de vários produtos |
+| `consultar_politicas` | Endereço, horário, pagamento, trocas, frete, rastreio, promoções, atendimento, garantia, LGPD |
+| `consultar_pedido` | Status, itens, rastreio e **prazos de devolução/troca/garantia já calculados**; exige número do pedido **e** e-mail ou telefone |
 | `encaminhar_para_equipe` | Reclamação, devolução, atraso, cotação, pedido de humano → gera protocolo |
 
 ---
@@ -137,9 +134,13 @@ nomeada (veja os blocos ⚙️ nos [exemplos](examples/)).
 - **Contas fora do LLM.** Preço promocional, preço no PIX, parcelamento com parcela mínima por faixa,
   frete e "quantos dias desde a entrega" são calculados em código. LLMs erram aritmética e datas; isso
   num atendimento vira propaganda enganosa (o próprio manual alerta para isso).
-- **Loop manual** em vez do *automatic function calling* do SDK: permite limitar passos (8 rodadas por
-  mensagem), capturar o rastro das chamadas (debug e exemplos), tratar erro de ferramenta sem derrubar a
-  conversa e fazer *rollback* do histórico se a API falhar.
+- **Sem framework de agentes** (LangChain, LangGraph etc.): o *automatic function calling* do próprio
+  SDK do Gemini já executa o ciclo "modelo pede ferramenta → Python executa → modelo responde", limita as
+  rodadas (8 por mensagem) e devolve o erro de uma ferramenta ao modelo sem derrubar a conversa. Um
+  framework só adicionaria dependências e abstrações para um único agente com 5 ferramentas.
+- **Poucas ferramentas, cada uma com uma função clara.** Uma só ferramenta de catálogo cobre preço,
+  estoque, promoções e detalhes; frete não tem ferramenta porque a regra (grátis acima de R$ 500 em
+  Campo Grande, cotação nas demais cidades) está no manual e não exige conta.
 
 ### 2. Modelo e provedor: Gemini 3.5 Flash (Google AI Studio, free tier)
 
@@ -147,9 +148,8 @@ nomeada (veja os blocos ⚙️ nos [exemplos](examples/)).
   Testei os modelos flash disponíveis e escolhi o `gemini-3.5-flash`: estável e rápido (~4 s/resposta) no
   momento dos testes, enquanto `gemini-3.7-flash`/`3.8-flash` devolviam 503 por alta demanda.
 - **Fallback entre modelos:** picos de 503 e a cota diária do free tier (20 requisições/dia **por modelo**)
-  são frequentes. O agente tenta cada modelo 2 vezes e depois passa para o próximo da lista
-  `GEMINI_FALLBACK_MODELS`. O retry interno do SDK foi desligado para o controle ficar num lugar só,
-  com timeout de 60 s por chamada.
+  são frequentes. O retry do próprio SDK tenta 2 vezes; se ainda falhar, o agente passa para o próximo
+  modelo da lista `GEMINI_FALLBACK_MODELS`. Timeout de 60 s por chamada.
 - Gratuito para prototipar, com function calling nativo e paralelo, bom português e baixa latência — o
   que importa num canal tipo WhatsApp.
 - Um modelo "flash" é suficiente porque a parte difícil (regras, contas, busca) está nas ferramentas;
@@ -177,8 +177,8 @@ O system prompt (`emporio/prompts.py`) é organizado em blocos:
 
 ### 4. Interface: CLI
 
-O foco do desafio é o agente funcionando. A CLI tem modo `--debug` que mostra cada ferramenta chamada e
-seu retorno, o que ajuda tanto a avaliar quanto a depurar. O `Agent` não depende da CLI: expor via API
+O foco do desafio é o agente funcionando. A CLI tem a opção `--debug`, que mostra cada ferramenta chamada
+e seu retorno. O `Agent` não depende da CLI: expor via API
 (FastAPI) ou plugar num webhook de WhatsApp é envolver `Agent.send()`.
 
 ### 5. Persistência do histórico
@@ -189,9 +189,7 @@ mensagem anterior) e porque o cliente pode voltar depois.
 - Cada sessão é um JSON em `.sessions/<id>.json` com o histórico completo (incluindo chamadas de
   ferramenta e *thought signatures* do Gemini, necessárias para manter o raciocínio entre turnos).
 - `--sessao <id>` retoma a conversa. Num canal real, o id seria o telefone do cliente.
-- Janela deslizante de 60 mensagens enviadas ao modelo, sempre cortando no início de uma mensagem do
-  cliente para não separar uma chamada de ferramenta da sua resposta.
-- Se a chamada à API falha no meio de um turno, o histórico volta ao estado anterior.
+- O histórico só é atualizado quando a resposta chega; se a API falhar, nada muda e o cliente pode reenviar.
 
 ### 6. Privacidade (LGPD)
 
@@ -207,8 +205,8 @@ revelar a existência de pedidos de terceiros. O agente só vê o primeiro nome 
 
 | Situação encontrada | Tratamento |
 |---|---|
-| `specs` é JSON em texto, com formatação inconsistente entre linhas | Parseado para dict; chaves traduzidas (`top` → tampo, `steel` → aço) |
-| Produtos com `status` = `active` / `discontinued` / `coming_soon` + `stock_quantity` | Disponibilidade derivada: ativo com estoque → disponível; ativo sem estoque → esgotado (sugere alternativas); `discontinued` → fora do catálogo **mesmo com estoque** (ex.: Ibanez Bass 2X, 13 un.); `coming_soon` → "em breve", não vendável |
+| `specs` é JSON em texto, com chaves diferentes por categoria (violões: `top`, `strings`; baterias: `shells`...) | Parseado para dict e incluído na busca, com `steel` → aço e `electronics: yes` → elétrico |
+| Produtos com `status` = `active` / `discontinued` / `coming_soon` + `stock_quantity` | Disponibilidade derivada: ativo com estoque → disponível; ativo sem estoque → esgotado (o agente busca alternativas da mesma categoria); `discontinued` → fora do catálogo **mesmo com estoque** (ex.: Ibanez Bass 2X, 13 un.); `coming_soon` → "em breve", não vendável |
 | Várias promoções por produto, a maioria inativa | Só `is_active=1` altera o preço (4 produtos). As inativas viram histórico para o agente responder "aquela promoção ainda vale?" com transparência |
 | Filtro "até R$ X" | Considera o **preço efetivo** (com promoção), sem o desconto do PIX |
 | Pedidos sem data real de entrega | Para pedidos `delivered`, a data de recebimento considerada é `estimated_delivery` (e o agente é avisado disso) |
@@ -222,6 +220,17 @@ Inconsistências detectadas e **não** corrigidas (o agente apresenta o valor do
 - O total de dois pedidos não bate com a soma dos preços de tabela atuais: pedido 3 (R$ 3.450 vs. 2 × R$ 1.749)
   e pedido 20 (R$ 1.400 vs. R$ 799 + R$ 689). Pode ser desconto da época ou erro de cadastro; o agente
   informa o total registrado no pedido.
+- **Produtos 135 a 144 (baixos, baterias e teclados) têm nome, descrição e especificações que não batem.**
+  Exemplos: "Yamaha Bass 3X" é descrito como "contrabaixo de 5 cordas Ibanez", mas a especificação diz 4
+  cordas; "Bateria Acústica Yamaha Kit 1" é descrita como "Pearl Export"; "Teclado Korg Synth 1" é descrito
+  como "Roland com 88 teclas", mas a especificação diz 61. O prompt manda o agente usar o nome do produto
+  e não afirmar o dado conflitante. Efeito colateral: uma busca por "teclado Yamaha" pode trazer o
+  "Roland Synth 3", cuja descrição cita Yamaha.
+- **Pedidos 9, 16 e 18 desrespeitam a parcela mínima do manual** (ex.: pedido 9, R$ 349,90 em 6x = R$ 58,32
+  por parcela, abaixo dos R$ 80). Provavelmente foram feitos antes da regra atual; o agente informa a forma
+  de pagamento registrada.
+- **Dois clientes com o mesmo e-mail:** Bruno Carvalho Martins (id 11) e Bruno Martins (id 43) usam
+  `bruno.martins@jmail.com`. Como a consulta exige também o número do pedido, um não vê o pedido do outro.
 
 ### Manual de políticas (PDF)
 
@@ -267,21 +276,26 @@ Conversas reais geradas com `scripts/gerar_exemplos.py`, com as chamadas de ferr
 
 ### O que a revisão das conversas mostrou
 
-Conferi cada valor citado nos exemplos contra os CSVs (preços, PIX, parcelas, % de promoção, datas de
-prazo): todos batem, porque vêm calculados pelas ferramentas. Pontos observados:
+Os exemplos atuais foram gerados com o `gemini-3.5-flash-lite`: no dia da geração, a cota diária dos modelos
+principais tinha acabado e o `gemini-3.7-flash`/`3.8-flash` respondiam 503. O fallback entre modelos foi o que
+permitiu gerar as conversas. Conferi cada valor citado contra os CSVs (preços, PIX, parcelas, % de
+promoção, datas de prazo, dias de atraso): todos batem, porque vêm calculados pelas ferramentas.
+Pontos observados:
 
-- **Alucinação de reputação (exemplo 01):** ao recomendar um violão para iniciante, o modelo afirmou que o
-  Yamaha C40 é "um dos favoritos dos professores" e elogiou o controle de qualidade da marca. Nada disso
-  está nos dados. Adicionei ao prompt a regra de justificar recomendações só com descrição, especificações
-  e preço vindos das ferramentas. O exemplo foi mantido como gerado, para registrar o problema; a cota diária
-  do free tier acabou antes de eu conseguir gerá-lo de novo
-  (`python scripts/gerar_exemplos.py 01_catalogo_violoes`).
-- **Chamada desnecessária (exemplo 04):** diante de "meu pedido não chegou", o agente consultou a política de
-  frete antes de pedir os dados do pedido. Não prejudica a resposta, mas gasta uma requisição.
-- **Reaproveitamento de contexto:** em perguntas de acompanhamento ("e no PIX?", "aquela promoção ainda
-  vale?"), o agente usa dados que já vieram de ferramentas no mesmo turno ou em turnos anteriores, sem
-  consultar de novo. É o comportamento esperado ("consultar nesta conversa"), mas numa conversa longa o
-  estoque pode mudar; em produção, valeria limitar esse reaproveitamento a alguns minutos.
+- **Afirmação sem base (exemplo 01):** o modelo diz que o Yamaha C40 é "um dos modelos mais procurados por
+  estudantes". A descrição do C40 diz só "ideal para estudantes e iniciantes" (quem tem "um dos modelos mais
+  vendidos" na descrição é o Yamaha F310). O prompt já proíbe opinião sem base; o modelo lite ainda escorrega.
+  Uma versão anterior, com o `gemini-3.5-flash`, chegou a inventar que o C40 era "favorito dos professores".
+- **Recomendação incompleta (exemplo 01):** para iniciante com nylon, o agente cita 3 violões, mas a busca
+  também trouxe o Giannini GN-15 (R$ 689) e o Yamaha C70 (R$ 849). Não está errado, mas omite opções.
+- **Prazo vencido mal explicado (exemplo 03):** sobre defeito, o agente diz que "a gente faz a troca na loja
+  em até 30 dias da compra", sem deixar claro que esse prazo já tinha vencido para o pedido 7 (a ferramenta
+  informou "fora do prazo"). A garantia legal (até 18/05/2026) foi informada corretamente.
+- **Chamada repetida (exemplo 02):** o agente chamou `buscar_produtos` duas vezes com os mesmos argumentos.
+- **Formatação:** às vezes usa negrito com dois asteriscos, apesar de o prompt pedir um.
+- **Pontos positivos:** pediu número do pedido e contato antes de consultar (03 e 04), não prometeu a
+  promoção encerrada (02), recusou acessórios, assunto fora do escopo e a tentativa de manipulação (05), e
+  só registrou o protocolo depois de o cliente concordar (04).
 
 ## Limitações conhecidas e próximos passos
 
@@ -297,6 +311,8 @@ prazo): todos batem, porque vêm calculados pelas ferramentas. Pontos observados
 - **Sem cálculo de frete por CEP** e sem saber feriados.
 - **Encaminhamento simulado** (arquivo JSONL), sem integração real com a equipe.
 - **Dados em memória**, carregados uma vez: alterações nos CSVs exigem reiniciar o agente.
+- **Modelo lite nos exemplos:** por falta de cota no dia, as conversas de `examples/` foram geradas com um
+  modelo mais fraco que o padrão; com o `gemini-3.5-flash` a redação tende a ser melhor.
 - **Identidade:** num WhatsApp real o telefone do remetente já identificaria o cliente; aqui ele precisa
   digitar e-mail/telefone.
 
@@ -331,6 +347,20 @@ projeto. O fluxo foi:
    CLI → exemplos → README, com um commit por etapa.
 4. **Validação:** rodei a suíte de testes e as conversas reais. Revisei as transcrições para checar se os
    valores citados batiam com os dados e ajustei prompt e ferramentas onde o comportamento não estava bom.
+5. **Simplificação:** com a primeira versão funcionando, pedi ao assistente para deixar a solução o mais
+   simples possível sem perder precisão. O laço manual de function calling deu lugar ao automático do SDK,
+   as ferramentas caíram de 9 para 5 e o código do agente de ~1.280 para ~530 linhas. Para checar que a
+   busca não piorou, comparamos a versão antiga e a nova em 15 buscas típicas; a primeira tentativa perdia
+   produtos (sinônimos como "eletroacústico" e "clássico"), o que foi corrigido antes de seguir.
+6. **Revisão final:** relemos enunciado, manual e dados linha a linha. Isso revelou inconsistências que
+   não tinham sido vistas (produtos 135–144, parcelas dos pedidos 9/16/18, e-mail duplicado) e uma falha
+   de privacidade: a consulta listava os pedidos de um cliente só com o e-mail. Agora ela exige número do
+   pedido e contato, como o próprio manual curado diz.
+7. **Bug encontrado ao gerar os exemplos de novo:** três ferramentas falhavam quando chamadas pelo
+   modelo, porque o SDK não converte argumentos para `Literal` (ex.: tópico da política) nem um número
+   inteiro para `float | None` (ex.: `preco_max: 1000`). Os testes chamavam as funções direto e não
+   pegaram isso. Corrigido com tipos simples, e foram adicionados testes que executam cada ferramenta pelo
+   mesmo caminho do SDK. Lição registrada: testar a integração com o SDK, não só as funções.
 
 O assistente acelerou a escrita de código e documentação. As decisões de produto (persona, como tratar
 as inconsistências, o que é fora do escopo, quando escalar para humano) foram revisadas por mim.
@@ -343,7 +373,7 @@ as inconsistências, o que é fora do escopo, quando escalar para humano) foram 
 ├── data/                       # dados fornecidos (CSVs + manual em PDF)
 ├── knowledge/politicas.md      # manual convertido e curado, por tópico
 ├── emporio/                    # código do agente
-│   ├── agent.py  cli.py  config.py  policies.py  prompts.py  store.py  tools.py
+│   ├── __main__.py  agent.py  prompts.py  tools.py
 ├── examples/                   # conversas de exemplo (geradas pelo agente)
 ├── scripts/gerar_exemplos.py
 ├── tests/                      # pytest (sem rede)
