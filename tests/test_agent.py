@@ -1,4 +1,4 @@
-"""Testes do agente com um chat falso (sem rede)."""
+# testa o Agent sem chamar a API, com um chat falso
 
 from types import SimpleNamespace
 
@@ -55,5 +55,5 @@ def test_cai_para_modelo_reserva_em_503(monkeypatch, tmp_path):
 
 def test_todos_os_modelos_falham(monkeypatch, tmp_path):
     a = make_agent(monkeypatch, tmp_path, [errors.ServerError(503, {})] * len(agent_mod.Agent().models))
-    assert a.send("oi") == (agent_mod.ERRO, [])
+    assert a.send("oi") == (agent_mod.MENSAGEM_ERRO, [])
     assert a.history == []

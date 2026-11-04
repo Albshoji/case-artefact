@@ -1,12 +1,8 @@
-"""Gera as conversas de exemplo em examples/*.md rodando o agente de verdade.
-
-Uso:  python scripts/gerar_exemplos.py [nome_do_cenario ...]
-
-A data é fixada em 25/03/2026 10:30 (quarta-feira): os pedidos do CSV vão até 22/03/2026,
-então essa data deixa os status (pendente/enviado/entregue) coerentes.
-"""
-
-from __future__ import annotations
+# Gera as conversas de examples/ rodando o agente de verdade.
+# Uso: python scripts/gerar_exemplos.py [cenario ...]
+#
+# Fixo a data em 25/03/2026 10:30 (quarta) porque os pedidos do csv vão até 22/03/2026,
+# assim os status e prazos fazem sentido.
 
 import json
 import os
@@ -67,47 +63,45 @@ SCENARIOS = {
 }
 
 
-def fmt_json(obj) -> str:
-    return json.dumps(obj, ensure_ascii=False, indent=2)
-
-
-def run(name: str, title: str, messages: list[str]) -> str:
+def gerar_conversa(titulo, mensagens):
     agent = Agent(persist=False)
-    lines = [
-        f"# {title}",
+    modelos = set()
+    linhas = [
+        f"# {titulo}",
         "",
         "> Gerado por `scripts/gerar_exemplos.py` · modelo `{MODELO}` · "
         f"data simulada {os.environ['AGENT_TODAY']} {os.environ['AGENT_TIME']} (quarta-feira)",
         "> As chamadas de ferramenta (invisíveis para o cliente) aparecem nos blocos recolhíveis.",
         "",
     ]
-    used = set()
-    for msg in messages:
-        reply, calls = agent.send(msg)
-        used.add(agent.model_used)
-        lines += [f"**👤 Cliente:** {msg}", ""]
-        if calls:
-            lines += [f"<details><summary>⚙️ {len(calls)} chamada(s) de ferramenta: "
-                      f"{', '.join(c['nome'] for c in calls)}</summary>", ""]
-            for c in calls:
-                lines += [f"`{c['nome']}({json.dumps(c['args'], ensure_ascii=False)})`", "", "```json",
-                          fmt_json(c["resultado"]), "```", ""]
-            lines += ["</details>", ""]
-        lines += [f"**🎸 Tom:** {reply.replace(chr(10), '  ' + chr(10))}", "", "---", ""]
-        time.sleep(4)  # respeita o rate limit do free tier
-    return "\n".join(lines).replace("{MODELO}", ", ".join(sorted(used - {""})))
 
+    for msg in mensagens:
+        resposta, chamadas = agent.send(msg)
+        if agent.model_used:
+            modelos.add(agent.model_used)
 
-def main() -> None:
-    out_dir = ROOT / "examples"
-    out_dir.mkdir(exist_ok=True)
-    selected = sys.argv[1:] or list(SCENARIOS)
-    for name in selected:
-        title, messages = SCENARIOS[name]
-        print(f"→ {name}...", flush=True)
-        (out_dir / f"{name}.md").write_text(run(name, title, messages), encoding="utf-8")
-    print("ok")
+        linhas += [f"**👤 Cliente:** {msg}", ""]
+        if chamadas:
+            nomes = ", ".join(c["nome"] for c in chamadas)
+            linhas += [f"<details><summary>⚙️ {len(chamadas)} chamada(s) de ferramenta: {nomes}</summary>", ""]
+            for c in chamadas:
+                args = json.dumps(c["args"], ensure_ascii=False)
+                resultado = json.dumps(c["resultado"], ensure_ascii=False, indent=2)
+                linhas += [f"`{c['nome']}({args})`", "", "```json", resultado, "```", ""]
+            linhas += ["</details>", ""]
+
+        resposta = resposta.replace("\n", "  \n")  # quebra de linha no markdown
+        linhas += [f"**🎸 Tom:** {resposta}", "", "---", ""]
+        time.sleep(4)  # limite de requisições do free tier
+
+    return "\n".join(linhas).replace("{MODELO}", ", ".join(sorted(modelos)))
 
 
 if __name__ == "__main__":
-    main()
+    pasta = ROOT / "examples"
+    pasta.mkdir(exist_ok=True)
+    for nome in sys.argv[1:] or SCENARIOS:
+        titulo, mensagens = SCENARIOS[nome]
+        print(f"gerando {nome}...", flush=True)
+        (pasta / f"{nome}.md").write_text(gerar_conversa(titulo, mensagens), encoding="utf-8")
+    print("pronto")

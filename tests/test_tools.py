@@ -1,14 +1,12 @@
-"""Testes das ferramentas (sem rede, sem LLM)."""
-
 import pytest
 from google.genai import types
 
 from emporio import tools
-from emporio.prompts import store_status
+from emporio.prompts import status_loja
 
 
 @pytest.fixture(autouse=True)
-def fixed_date(monkeypatch, tmp_path):
+def data_fixa(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_TODAY", "2026-03-25")
     monkeypatch.setattr(tools, "LOGS_DIR", tmp_path)
 
@@ -16,8 +14,6 @@ def fixed_date(monkeypatch, tmp_path):
 def nomes(r, campo="disponiveis"):
     return [p["nome"] for p in r[campo]]
 
-
-# ------------------------------------------------------------------ catálogo
 
 def test_violoes_ate_1000_so_disponiveis():
     r = tools.buscar_produtos(categoria="Violões", preco_max=1000)
@@ -68,8 +64,6 @@ def test_promocoes_ativas():
     assert tools.buscar_produtos(so_promocoes=True)["total_disponiveis"] == 4
 
 
-# ------------------------------------------------------------------ pagamento
-
 @pytest.mark.parametrize("valor,parcelas", [(2199, 12), (599, 6), (159.9, 3), (90, 1), (1000, 10)])
 def test_parcelamento(valor, parcelas):
     assert tools.calcular_pagamento(valor)["cartao"].startswith(f"até {parcelas}x")
@@ -82,17 +76,13 @@ def test_pix_e_combinacao():
     assert tools.calcular_pagamento(1500)["pode_combinar_formas"] is False
 
 
-# ------------------------------------------------------------------ políticas
-
 def test_politicas():
-    assert len(tools.POLICIES) == 10
+    assert len(tools.POLITICAS) == 10
     assert "09:00 às 18:00" in tools.consultar_politicas("horario")["texto"]
     assert "3341-4444" in tools.consultar_politicas("sobre_loja")["texto"]
     assert "topicos_validos" in tools.consultar_politicas("inexistente")
     assert "categorias_validas" in tools.buscar_produtos(categoria="Violinos")
 
-
-# ------------------------------------------------------------------ pedidos
 
 def test_pedido_exige_contato_correto():
     assert "erro" in tools.consultar_pedido(1, "outra.pessoa@jmail.com")
@@ -121,8 +111,6 @@ def test_encaminhamento_gera_protocolo(tmp_path):
     assert (tmp_path / "encaminhamentos.jsonl").exists()
 
 
-# ------------------------------------------------------------------ integração com o SDK e prompt
-
 def test_sdk_gera_schema_de_todas_as_ferramentas():
     for fn in tools.TOOLS:
         decl = types.FunctionDeclaration.from_callable_with_api_option(callable=fn, api_option="GEMINI_API")
@@ -140,7 +128,7 @@ def test_sdk_gera_schema_de_todas_as_ferramentas():
     (tools.encaminhar_para_equipe, {"motivo": "atraso_entrega", "resumo": "Pedido 8 atrasado", "numero_pedido": 8}),
 ])
 def test_ferramentas_pelo_caminho_do_sdk(fn, args):
-    """Executa como o SDK executa (conversão de argumentos incluída): nenhum erro pode escapar."""
+    # roda do mesmo jeito que o SDK roda, com a conversão de argumentos (foi aqui que o Literal quebrava)
     from google.genai import _extra_utils
     result = _extra_utils.invoke_function_from_dict_args(
         _extra_utils.convert_number_values_for_dict_function_call_args(args), fn)
@@ -150,6 +138,6 @@ def test_ferramentas_pelo_caminho_do_sdk(fn, args):
 def test_status_da_loja():
     from datetime import datetime
     tz = tools.TZ
-    assert store_status(datetime(2026, 3, 25, 10, 30, tzinfo=tz)).startswith("ABERTA")
-    assert "segunda-feira" in store_status(datetime(2026, 3, 28, 14, 0, tzinfo=tz))  # sábado à tarde
-    assert "amanhã" in store_status(datetime(2026, 3, 29, 10, 0, tzinfo=tz))         # domingo
+    assert status_loja(datetime(2026, 3, 25, 10, 30, tzinfo=tz)).startswith("ABERTA")
+    assert "segunda-feira" in status_loja(datetime(2026, 3, 28, 14, 0, tzinfo=tz))  # sábado à tarde
+    assert "amanhã" in status_loja(datetime(2026, 3, 29, 10, 0, tzinfo=tz))         # domingo
